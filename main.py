@@ -1,12 +1,13 @@
 """
-Telegram-бот — Полина Евдокимова. v12
-✅ Кэш admin-проверки в памяти — кнопки появляются мгновенно
-✅ Исправлено отображение записей в админке
-✅ Ручная отправка напоминания о записи из админки
-✅ Автонапоминания за 24ч / 6ч / 1ч
+Telegram-бот — Полина Евдокимова. v13
+✅ Подтверждение записи = 1 кнопка, дата берётся из слов клиента автоматически
+✅ Настройка напоминаний в админ-панели (вкл/выкл каждый интервал)
+✅ Удаление записи после подтверждения
+✅ Записи хранятся в SQLite — не теряются при перезапуске
+✅ Кэш админов в памяти — кнопки мгновенные
 """
 
-import asyncio, logging, json, urllib.parse, aiosqlite
+import asyncio, logging, json, re, urllib.parse, aiosqlite
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -22,6 +23,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SQLITE FSM STORAGE
@@ -118,8 +120,12 @@ DEFAULT_SERVICE_TEXTS = [
     "Здравствуйте, я с бота по записи, хочу записаться на укладку локоны",
 ]
 
-# ✅ КЭШ АДМИНОВ В ПАМЯТИ — нет запроса к БД при каждом нажатии кнопки
+# Кэш авторизованных админов в памяти — проверка мгновенная без запроса к БД
 ADMIN_CACHE: set[int] = set()
+
+# Кэш настроек напоминаний в памяти (обновляется из БД при старте)
+# Формат: {"r24": True, "r12": False, "r6": True, "r1": True}
+REMINDER_SETTINGS: dict = {"r24": True, "r12": False, "r6": True, "r1": True}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,6 +158,7 @@ async def init_db():
                 rating INTEGER NOT NULL, text TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL
             );
+            -- status: pending | confirmed | cancelled
             CREATE TABLE IF NOT EXISTS bookings (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id      INTEGER NOT NULL,
@@ -162,18 +169,39 @@ async def init_db():
                 appt_dt      TEXT,
                 status       TEXT NOT NULL DEFAULT 'pending',
                 reminded_24  INTEGER DEFAULT 0,
+                reminded_12  INTEGER DEFAULT 0,
                 reminded_6   INTEGER DEFAULT 0,
                 reminded_1   INTEGER DEFAULT 0,
                 created_at   TEXT NOT NULL
             );
+            -- Настройки бота (ключ-значение)
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
         await db.commit()
-        # Загружаем авторизованных админов в кэш при старте
+
+        # Загружаем кэш админов
         cur = await db.execute("SELECT user_id FROM admin_sessions")
+        for row in await cur.fetchall():
+            ADMIN_CACHE.add(row[0])
+
+        # Загружаем настройки напоминаний
+        cur = await db.execute("SELECT key, value FROM settings WHERE key LIKE 'reminder_%'")
         rows = await cur.fetchall()
-        for r in rows:
-            ADMIN_CACHE.add(r[0])
-    log.info(f"БД готова. Кэш админов: {ADMIN_CACHE}")
+        mapping = {"reminder_24":"r24","reminder_12":"r12","reminder_6":"r6","reminder_1":"r1"}
+        for key, val in rows:
+            if key in mapping:
+                REMINDER_SETTINGS[mapping[key]] = (val == "1")
+
+    log.info(f"БД готова. Админы: {ADMIN_CACHE}. Напоминания: {REMINDER_SETTINGS}")
+
+
+async def db_save_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO settings (key,value) VALUES(?,?)", (key, value))
+        await db.commit()
 
 
 # ── Пользователи ──────────────────────────────────────────────────────────────
@@ -223,10 +251,10 @@ async def db_reset_service_text(idx):
         await db.commit()
 
 
-# ── Авторизация (БД + кэш) ────────────────────────────────────────────────────
+# ── Авторизация ───────────────────────────────────────────────────────────────
 
 async def db_admin_add(user_id):
-    ADMIN_CACHE.add(user_id)  # сразу в кэш
+    ADMIN_CACHE.add(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR REPLACE INTO admin_sessions (user_id,authed_at) VALUES(?,?)",
                          (user_id, datetime.now().isoformat()))
@@ -311,27 +339,12 @@ async def db_get_confirmed_bookings():
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT id,user_id,username,first_name,service_name,datetime_txt,appt_dt
-            FROM bookings WHERE status='confirmed' ORDER BY appt_dt ASC
+            FROM bookings WHERE status='confirmed' ORDER BY
+                CASE WHEN appt_dt IS NOT NULL THEN appt_dt ELSE datetime_txt END ASC
         """)
         rows = await cur.fetchall()
     return [{"id":r[0],"user_id":r[1],"username":r[2],"first_name":r[3],
              "service_name":r[4],"datetime_txt":r[5],"appt_dt":r[6]} for r in rows]
-
-async def db_get_bookings_for_reminders():
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT id,user_id,service_name,appt_dt,reminded_24,reminded_6,reminded_1
-            FROM bookings WHERE status='confirmed' AND appt_dt IS NOT NULL
-              AND (reminded_24=0 OR reminded_6=0 OR reminded_1=0)
-        """)
-        rows = await cur.fetchall()
-    return [{"id":r[0],"user_id":r[1],"service_name":r[2],"appt_dt":r[3],
-             "reminded_24":r[4],"reminded_6":r[5],"reminded_1":r[6]} for r in rows]
-
-async def db_mark_reminded(booking_id, field):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(f"UPDATE bookings SET {field}=1 WHERE id=?", (booking_id,))
-        await db.commit()
 
 async def db_get_booking(booking_id):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -344,14 +357,29 @@ async def db_get_booking(booking_id):
     return {"id":row[0],"user_id":row[1],"username":row[2],"first_name":row[3],
             "service_name":row[4],"datetime_txt":row[5],"appt_dt":row[6],"status":row[7]}
 
+async def db_get_bookings_for_reminders():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT id,user_id,service_name,appt_dt,reminded_24,reminded_12,reminded_6,reminded_1
+            FROM bookings WHERE status='confirmed' AND appt_dt IS NOT NULL
+              AND (reminded_24=0 OR reminded_12=0 OR reminded_6=0 OR reminded_1=0)
+        """)
+        rows = await cur.fetchall()
+    return [{"id":r[0],"user_id":r[1],"service_name":r[2],"appt_dt":r[3],
+             "reminded_24":r[4],"reminded_12":r[5],"reminded_6":r[6],"reminded_1":r[7]} for r in rows]
+
+async def db_mark_reminded(booking_id, field):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE bookings SET {field}=1 WHERE id=?", (booking_id,))
+        await db.commit()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ХЭЛПЕРЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
-def is_admin(user_id: int) -> bool:
-    """Синхронная проверка через кэш — мгновенно, без запроса к БД."""
-    return user_id == ADMIN_ID or user_id in ADMIN_CACHE
+def is_admin(uid: int) -> bool:
+    return uid == ADMIN_ID or uid in ADMIN_CACHE
 
 async def make_master_link(idx):
     text = await db_get_service_text(idx)
@@ -366,24 +394,51 @@ def fmt_review(r, idx, total):
             f"{stars(r['rating'])}  <b>{name}</b>{uname}\n"
             f"<i>{r['created_at'][:10]}</i>\n\n{r['text']}")
 
-def parse_dt(text):
+def parse_dt_from_text(text: str) -> datetime | None:
+    """
+    Умно ищет дату и время в свободном тексте клиента.
+    Понимает: '15.01 14:00', '15.01.2025 14:00', '15 января в 14:00' и т.д.
+    """
+    text = text.strip().lower()
+    now  = datetime.now()
+
+    # Формат ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ
     for fmt in ("%d.%m.%Y %H:%M", "%d.%m %H:%M"):
+        m = re.search(r'\d{1,2}\.\d{1,2}(?:\.\d{4})?\s+\d{1,2}:\d{2}', text)
+        if m:
+            try:
+                dt = datetime.strptime(m.group(), fmt)
+                if fmt == "%d.%m %H:%M":
+                    dt = dt.replace(year=now.year)
+                return dt
+            except: pass
+
+    # Формат ДД.ММ.ГГГГ ЧЧ:ММ без пробела
+    m = re.search(r'(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s+(\d{1,2}):(\d{2})', text)
+    if m:
+        day, mon, yr, hr, mi = m.groups()
+        yr = int(yr) if yr else now.year
         try:
-            dt = datetime.strptime(text.strip(), fmt)
-            if fmt == "%d.%m %H:%M":
-                dt = dt.replace(year=datetime.now().year)
-            return dt
-        except ValueError:
-            continue
+            return datetime(int(yr), int(mon), int(day), int(hr), int(mi))
+        except: pass
+
     return None
 
-def fmt_dt(iso):
+def fmt_dt(iso: str) -> str:
     try:
         dt = datetime.fromisoformat(iso)
         m  = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"][dt.month-1]
         return f"{dt.day} {m} в {dt.strftime('%H:%M')}"
     except:
         return iso
+
+def reminder_label() -> str:
+    active = []
+    if REMINDER_SETTINGS["r24"]: active.append("24ч")
+    if REMINDER_SETTINGS["r12"]: active.append("12ч")
+    if REMINDER_SETTINGS["r6"]:  active.append("6ч")
+    if REMINDER_SETTINGS["r1"]:  active.append("1ч")
+    return ", ".join(active) if active else "выключены"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -395,7 +450,6 @@ class AdminFSM(StatesGroup):
     broadcast_msg     = State()
     broadcast_confirm = State()
     edit_svc_text     = State()
-    confirm_booking   = State()
 
 class ReviewFSM(StatesGroup):
     rating = State()
@@ -411,7 +465,7 @@ class IsAdmin(Filter):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  КЛАВИАТУРЫ  (все синхронные — мгновенная отрисовка)
+#  КЛАВИАТУРЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
 def kb_main(admin=False) -> InlineKeyboardMarkup:
@@ -457,24 +511,28 @@ def kb_svc_page(svc_index: int, master_url: str) -> InlineKeyboardMarkup:
     b.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"))
     return b.as_markup()
 
-def kb_cancel_to_main() -> InlineKeyboardMarkup:
+def kb_cancel_main() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu"))
     return b.as_markup()
 
-def kb_cancel_to_adm() -> InlineKeyboardMarkup:
+def kb_cancel_adm() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel"))
     return b.as_markup()
 
 def kb_admin_main() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="👥 Список пользователей",    callback_data="adm_users"))
-    b.row(InlineKeyboardButton(text="📋 Записи клиентов",         callback_data="adm_bookings"))
-    b.row(InlineKeyboardButton(text="📣 Рассылка всем клиентам",  callback_data="adm_broadcast"))
-    b.row(InlineKeyboardButton(text="✏️ Тексты для записи",       callback_data="adm_svc_texts"))
-    b.row(InlineKeyboardButton(text="🛡 Модерация отзывов",       callback_data="adm_reviews"))
-    b.row(InlineKeyboardButton(text="🔙 Главное меню",            callback_data="main_menu"))
+    b.row(InlineKeyboardButton(text="👥 Список пользователей",          callback_data="adm_users"))
+    b.row(InlineKeyboardButton(text="📋 Записи клиентов",               callback_data="adm_bookings"))
+    b.row(InlineKeyboardButton(text="📣 Рассылка всем клиентам",        callback_data="adm_broadcast"))
+    b.row(InlineKeyboardButton(text="✏️ Тексты для записи",             callback_data="adm_svc_texts"))
+    b.row(InlineKeyboardButton(text="🛡 Модерация отзывов",             callback_data="adm_reviews"))
+    b.row(InlineKeyboardButton(
+        text=f"🔔 Напоминания: {reminder_label()}",
+        callback_data="adm_reminders"
+    ))
+    b.row(InlineKeyboardButton(text="🔙 Главное меню",                  callback_data="main_menu"))
     return b.as_markup()
 
 def kb_broadcast_confirm() -> InlineKeyboardMarkup:
@@ -500,25 +558,78 @@ def kb_svc_edit(idx) -> InlineKeyboardMarkup:
 def kb_bookings_nav() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="🕐 Ожидают подтверждения", callback_data="adm_book_pending"))
-    b.row(InlineKeyboardButton(text="✅ Подтверждённые",         callback_data="adm_book_confirmed"))
+    b.row(InlineKeyboardButton(text="✅ Подтверждённые",         callback_data="adm_book_confirmed:0"))
     b.row(InlineKeyboardButton(text="🔙 Панель администратора",  callback_data="admin_panel"))
     return b.as_markup()
 
-def kb_booking_moderate(booking_id) -> InlineKeyboardMarkup:
+def kb_booking_moderate(booking_id, datetime_txt="") -> InlineKeyboardMarkup:
+    """Кнопки для заявки: подтвердить (с автоопределением даты) и отклонить."""
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm_book_ok:{booking_id}"),
-          InlineKeyboardButton(text="❌ Отклонить",   callback_data=f"adm_book_del:{booking_id}"))
-    b.row(InlineKeyboardButton(text="🔙 К заявкам",   callback_data="adm_book_pending"))
+    # Если дата успешно распознана — показываем её в кнопке
+    dt = parse_dt_from_text(datetime_txt) if datetime_txt else None
+    if dt:
+        dt_str = fmt_dt(dt.isoformat())
+        b.row(InlineKeyboardButton(
+            text=f"✅ Подтвердить ({dt_str})",
+            callback_data=f"adm_book_ok:{booking_id}"
+        ))
+    else:
+        b.row(InlineKeyboardButton(
+            text="✅ Подтвердить",
+            callback_data=f"adm_book_ok:{booking_id}"
+        ))
+    b.row(InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_book_del:{booking_id}"))
+    b.row(InlineKeyboardButton(text="🔙 К заявкам", callback_data="adm_book_pending"))
     return b.as_markup()
 
-def kb_booking_confirmed(booking_id) -> InlineKeyboardMarkup:
-    """Кнопки для подтверждённой записи: ручное напоминание + отмена."""
+def kb_booking_actions(booking_id) -> InlineKeyboardMarkup:
+    """Кнопки для подтверждённой записи."""
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="🔔 Отправить напоминание клиенту",
-                               callback_data=f"adm_remind:{booking_id}"))
-    b.row(InlineKeyboardButton(text="❌ Отменить запись",
-                               callback_data=f"adm_book_del:{booking_id}"))
-    b.row(InlineKeyboardButton(text="🔙 К записям", callback_data="adm_book_confirmed"))
+    b.row(InlineKeyboardButton(
+        text="🔔 Отправить напоминание",
+        callback_data=f"adm_remind:{booking_id}"
+    ))
+    b.row(InlineKeyboardButton(
+        text="❌ Отменить запись",
+        callback_data=f"adm_book_del:{booking_id}"
+    ))
+    b.row(InlineKeyboardButton(text="🔙 К записям", callback_data="adm_book_confirmed:0"))
+    return b.as_markup()
+
+def kb_confirmed_nav(idx, total, booking_id) -> InlineKeyboardMarkup:
+    """Навигация по подтверждённым записям + управление."""
+    b = InlineKeyboardBuilder()
+    nav = []
+    if idx > 0:
+        nav.append(InlineKeyboardButton(text="◀", callback_data=f"adm_book_confirmed:{idx-1}"))
+    nav.append(InlineKeyboardButton(text=f"{idx+1}/{total}", callback_data="noop"))
+    if idx < total - 1:
+        nav.append(InlineKeyboardButton(text="▶", callback_data=f"adm_book_confirmed:{idx+1}"))
+    if nav: b.row(*nav)
+    b.row(InlineKeyboardButton(
+        text="🔔 Отправить напоминание",
+        callback_data=f"adm_remind:{booking_id}"
+    ))
+    b.row(InlineKeyboardButton(
+        text="❌ Отменить запись",
+        callback_data=f"adm_book_del:{booking_id}"
+    ))
+    b.row(InlineKeyboardButton(text="🔙 К записям", callback_data="adm_bookings"))
+    return b.as_markup()
+
+def kb_reminders() -> InlineKeyboardMarkup:
+    """Настройка напоминаний — toggle кнопки."""
+    def icon(key): return "✅" if REMINDER_SETTINGS[key] else "❌"
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(
+        text=f"{icon('r24')} За 24 часа",  callback_data="adm_rem_toggle:r24"))
+    b.row(InlineKeyboardButton(
+        text=f"{icon('r12')} За 12 часов", callback_data="adm_rem_toggle:r12"))
+    b.row(InlineKeyboardButton(
+        text=f"{icon('r6')}  За 6 часов",  callback_data="adm_rem_toggle:r6"))
+    b.row(InlineKeyboardButton(
+        text=f"{icon('r1')}  За 1 час",    callback_data="adm_rem_toggle:r1"))
+    b.row(InlineKeyboardButton(text="🔙 Панель администратора", callback_data="admin_panel"))
     return b.as_markup()
 
 def kb_reviews_menu() -> InlineKeyboardMarkup:
@@ -674,7 +785,7 @@ async def cb_portfolio(cb: CallbackQuery):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ЗАПИСЬ
+#  ЗАПИСЬ (клиент)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @user_router.callback_query(F.data == "book_start")
@@ -688,7 +799,7 @@ async def cb_svc(cb: CallbackQuery):
     idx = int(cb.data.split(":")[1])
     if idx >= len(SERVICES): return
     name, price = SERVICES[idx]
-    url = await make_master_link(idx)  # единственный async вызов здесь — нужен для ссылки
+    url = await make_master_link(idx)
     await cb.message.edit_text(
         f"✅ Вы выбрали: <b>{name}</b>  —  {price}\n\n"
         f"<b>Шаг 1:</b> Нажмите «Написать мастеру», договоритесь о дате и времени.\n\n"
@@ -707,7 +818,7 @@ async def cb_booking_approved(cb: CallbackQuery, state: FSMContext):
         f"📅 <b>Оформление записи</b>\n\nУслуга: <b>{name}</b>\n\n"
         f"Введите дату и время, которые вы согласовали с мастером:\n"
         f"<i>Пример: <code>15.01 14:00</code> или <code>15.01.2025 14:00</code></i>",
-        reply_markup=kb_cancel_to_main()
+        reply_markup=kb_cancel_main()
     )
 
 @booking_router.message(BookingFSM.datetime_txt)
@@ -722,20 +833,27 @@ async def fsm_booking_dt(message: Message, state: FSMContext, bot: Bot):
 
     await message.answer(
         f"✅ <b>Заявка отправлена!</b>\n\nУслуга: <b>{service}</b>\nДата: <b>{text}</b>\n\n"
-        f"⏳ Ожидайте подтверждения от мастера.",
+        f"⏳ Ожидайте подтверждения — придёт уведомление в бот.",
         reply_markup=kb_main(is_admin(u.id))
     )
+
     name  = u.first_name or "Аноним"
     uname = f" (@{u.username})" if u.username else ""
+
+    # Пробуем автоматически распознать дату
+    dt_auto = parse_dt_from_text(text)
+    dt_hint = f"\n\n🤖 Автоопределённая дата: <b>{fmt_dt(dt_auto.isoformat())}</b>" if dt_auto else \
+              "\n\n⚠️ Дату не удалось распознать автоматически."
+
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"📋 <b>Новая заявка на запись!</b>\n\n"
-            f"Клиент: <b>{name}</b>{uname}\n"
-            f"Услуга: <b>{service}</b>\n"
-            f"Дата (слова клиента): <b>{text}</b>\n\n"
-            f"<i>ID заявки: {bid}</i>",
-            reply_markup=kb_booking_moderate(bid)
+            f"📋 <b>Новая заявка #{bid}!</b>\n\n"
+            f"👤 <b>{name}</b>{uname}\n"
+            f"💇‍♀️ <b>{service}</b>\n"
+            f"📅 Клиент написал: <b>{text}</b>"
+            f"{dt_hint}",
+            reply_markup=kb_booking_moderate(bid, text)
         )
     except: pass
 
@@ -822,7 +940,7 @@ async def cb_review_submit(cb: CallbackQuery, state: FSMContext, bot: Bot):
     uname = f" (@{u.username})" if u.username else ""
     try:
         await bot.send_message(ADMIN_ID,
-            f"🔔 <b>Новый отзыв!</b>\n\nОт: <b>{name}</b>{uname}\nОценка: {stars(rating)}\n\n{text}\n\n<i>ID: {rid}</i>",
+            f"🔔 <b>Новый отзыв!</b>\n\nОт: <b>{name}</b>{uname}\nОценка: {stars(rating)}\n\n{text}",
             reply_markup=kb_moderate_review(rid))
     except: pass
 
@@ -873,58 +991,101 @@ async def cb_adm_book_pending(cb: CallbackQuery):
     await cb.answer()
     bookings = await db_get_pending_bookings()
     if not bookings:
-        await cb.message.edit_text("🕐 <b>Нет заявок на подтверждение.</b>", reply_markup=kb_bookings_nav())
+        await cb.message.edit_text("🕐 <b>Заявок на подтверждение нет.</b>", reply_markup=kb_bookings_nav())
         return
     b     = bookings[0]
     name  = b["first_name"] or "Аноним"
     uname = f" (@{b['username']})" if b["username"] else ""
+
+    # Автоопределение даты из текста клиента
+    dt_auto = parse_dt_from_text(b["datetime_txt"])
+    dt_line = f"\n🤖 Авто: <b>{fmt_dt(dt_auto.isoformat())}</b>" if dt_auto else \
+              "\n⚠️ Дату не удалось определить автоматически"
+
     await cb.message.edit_text(
         f"🕐 <b>Заявок: {len(bookings)} шт.</b>\n\n{'─'*26}\n"
         f"👤 <b>{name}</b>{uname}\n"
-        f"💇‍♀️ {b['service_name']}\n"
-        f"📅 {b['datetime_txt']}\n"
-        f"🕒 Заявка от: {b['created_at'][:16].replace('T',' ')}",
-        reply_markup=kb_booking_moderate(b["id"])
+        f"💇‍♀️ <b>{b['service_name']}</b>\n"
+        f"📅 Написал: <b>{b['datetime_txt']}</b>"
+        f"{dt_line}\n"
+        f"🕒 Заявка: {b['created_at'][:16].replace('T',' ')}",
+        reply_markup=kb_booking_moderate(b["id"], b["datetime_txt"])
     )
 
-@admin_cb_router.callback_query(F.data == "adm_book_confirmed")
+@admin_cb_router.callback_query(F.data.startswith("adm_book_confirmed:"))
 async def cb_adm_book_confirmed(cb: CallbackQuery):
     await cb.answer()
+    idx      = int(cb.data.split(":")[1])
     bookings = await db_get_confirmed_bookings()
     if not bookings:
         await cb.message.edit_text("✅ <b>Подтверждённых записей нет.</b>", reply_markup=kb_bookings_nav())
         return
-    lines = [f"✅ <b>Подтверждённые записи: {len(bookings)} шт.</b>\n"]
-    for b in bookings:
-        name  = b["first_name"] or "Аноним"
-        uname = f" @{b['username']}" if b["username"] else ""
-        dt    = fmt_dt(b["appt_dt"]) if b["appt_dt"] else b["datetime_txt"]
-        lines.append(
-            f"• <b>{name}</b>{uname}\n"
-            f"  💇‍♀️ {b['service_name']}\n"
-            f"  📅 {dt} — /book_{b['id']}"
-        )
-    lines.append("\n<i>Нажмите /book_ID для управления записью</i>")
-    await cb.message.edit_text("\n".join(lines), reply_markup=kb_bookings_nav())
+    idx = max(0, min(idx, len(bookings)-1))
+    b     = bookings[idx]
+    name  = b["first_name"] or "Аноним"
+    uname = f" (@{b['username']})" if b["username"] else ""
+    dt    = fmt_dt(b["appt_dt"]) if b["appt_dt"] else b["datetime_txt"]
+    await cb.message.edit_text(
+        f"✅ <b>Подтверждённые записи: {len(bookings)} шт.</b>\n\n{'─'*26}\n"
+        f"👤 <b>{name}</b>{uname}\n"
+        f"💇‍♀️ <b>{b['service_name']}</b>\n"
+        f"📅 <b>{dt}</b>",
+        reply_markup=kb_confirmed_nav(idx, len(bookings), b["id"])
+    )
 
 @admin_cb_router.callback_query(F.data.startswith("adm_book_ok:"))
-async def cb_adm_book_ok(cb: CallbackQuery, state: FSMContext):
+async def cb_adm_book_ok(cb: CallbackQuery, bot: Bot):
+    """
+    Подтверждение записи одной кнопкой.
+    Дата берётся автоматически из текста клиента.
+    """
     await cb.answer()
     bid     = int(cb.data.split(":")[1])
     booking = await db_get_booking(bid)
     if not booking:
         await cb.answer("Запись не найдена.", show_alert=True)
         return
-    await state.set_state(AdminFSM.confirm_booking)
-    await state.update_data(confirming_id=bid, confirming_uid=booking["user_id"],
-                             confirming_service=booking["service_name"])
-    await cb.message.edit_text(
-        f"✅ <b>Подтверждение записи</b>\n\n"
-        f"Клиент написал: <b>{booking['datetime_txt']}</b>\n\n"
-        f"Введите точную дату/время для напоминаний:\n"
-        f"<i>Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\nПример: <code>15.01.2025 14:00</code></i>",
-        reply_markup=kb_cancel_to_adm()
-    )
+
+    dt = parse_dt_from_text(booking["datetime_txt"])
+
+    if dt:
+        # Дата распознана — подтверждаем сразу
+        await db_confirm_booking(bid, dt.isoformat())
+        dt_fmt = fmt_dt(dt.isoformat())
+        active = reminder_label()
+
+        try:
+            await bot.send_message(
+                booking["user_id"],
+                f"🎉 <b>Ваша запись подтверждена!</b>\n\n"
+                f"💇‍♀️ Услуга: <b>{booking['service_name']}</b>\n"
+                f"📅 Дата и время: <b>{dt_fmt}</b>\n"
+                f"✂️ Мастер: <b>{MASTER_NAME_FULL}</b>\n\n"
+                f"Напоминания придут автоматически ({active}).\n"
+                f"<i>Если нужно перенести — напишите мастеру.</i>"
+            )
+        except: pass
+
+        await cb.message.edit_text(
+            f"✅ <b>Запись #{bid} подтверждена!</b>\n\n"
+            f"💇‍♀️ {booking['service_name']}\n"
+            f"📅 {dt_fmt}\n\n"
+            f"Клиент уведомлён. Напоминания: {active}.",
+            reply_markup=kb_adm_back()
+        )
+    else:
+        # Дату не удалось распознать — просим ввести вручную
+        await cb.message.edit_text(
+            f"⚠️ <b>Не удалось определить дату из текста клиента.</b>\n\n"
+            f"Клиент написал: <b>{booking['datetime_txt']}</b>\n\n"
+            f"Введите дату вручную:\n"
+            f"<i>Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\nПример: <code>15.01.2025 14:00</code></i>",
+            reply_markup=kb_cancel_adm()
+        )
+        # Сохраняем в FSM для обработки ввода
+        # (используем временный state через message, но у нас callback — сохраняем в БД)
+        # Запишем booking_id в settings как временное значение
+        await db_save_setting("pending_confirm_bid", str(bid))
 
 @admin_cb_router.callback_query(F.data.startswith("adm_book_del:"))
 async def cb_adm_book_del(cb: CallbackQuery, bot: Bot):
@@ -942,11 +1103,13 @@ async def cb_adm_book_del(cb: CallbackQuery, bot: Bot):
                 reply_markup=kb_main(False)
             )
         except: pass
-    await cb.message.edit_text("❌ Запись отменена, клиент уведомлён.", reply_markup=kb_bookings_nav())
+    await cb.message.edit_text(
+        f"❌ Запись #{bid} отменена, клиент уведомлён.",
+        reply_markup=kb_bookings_nav()
+    )
 
 @admin_cb_router.callback_query(F.data.startswith("adm_remind:"))
 async def cb_adm_remind(cb: CallbackQuery, bot: Bot):
-    """Ручная отправка напоминания клиенту о записи."""
     await cb.answer("🔔 Напоминание отправлено!")
     bid     = int(cb.data.split(":")[1])
     booking = await db_get_booking(bid)
@@ -965,7 +1128,34 @@ async def cb_adm_remind(cb: CallbackQuery, bot: Bot):
         )
     except: pass
 
-# ── Команда /book_ID для управления конкретной записью ────────────────────────
+# ── Настройка напоминаний ─────────────────────────────────────────────────────
+
+@admin_cb_router.callback_query(F.data == "adm_reminders")
+async def cb_adm_reminders(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.edit_text(
+        f"🔔 <b>Настройка автонапоминаний</b>\n\n"
+        f"Выберите когда отправлять напоминания клиентам.\n"
+        f"✅ = включено  |  ❌ = выключено\n\n"
+        f"<i>Изменения применяются сразу для всех будущих напоминаний.</i>",
+        reply_markup=kb_reminders()
+    )
+
+@admin_cb_router.callback_query(F.data.startswith("adm_rem_toggle:"))
+async def cb_adm_rem_toggle(cb: CallbackQuery):
+    await cb.answer()
+    key = cb.data.split(":")[1]  # r24 / r12 / r6 / r1
+    if key not in REMINDER_SETTINGS:
+        return
+    # Переключаем
+    REMINDER_SETTINGS[key] = not REMINDER_SETTINGS[key]
+    # Сохраняем в БД
+    db_key = key.replace("r", "reminder_")
+    await db_save_setting(db_key, "1" if REMINDER_SETTINGS[key] else "0")
+    # Обновляем клавиатуру
+    await cb.message.edit_reply_markup(reply_markup=kb_reminders())
+
+# ── Тексты услуг ──────────────────────────────────────────────────────────────
 
 @admin_cb_router.callback_query(F.data == "adm_svc_texts")
 async def cb_adm_svc_texts(cb: CallbackQuery, state: FSMContext):
@@ -1002,6 +1192,8 @@ async def cb_adm_reset_svc(cb: CallbackQuery, state: FSMContext):
         reply_markup=kb_svc_list()
     )
 
+# ── Рассылка ──────────────────────────────────────────────────────────────────
+
 @admin_cb_router.callback_query(F.data == "adm_broadcast")
 async def cb_adm_broadcast(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -1034,6 +1226,8 @@ async def cb_adm_do_broadcast(cb: CallbackQuery, state: FSMContext, bot: Bot):
         f"✅ <b>Рассылка завершена!</b>\n\n✔ Отправлено: <b>{sent}</b>\n✖ Ошибок: <b>{failed}</b>",
         reply_markup=kb_admin_main()
     )
+
+# ── Модерация отзывов ─────────────────────────────────────────────────────────
 
 @admin_cb_router.callback_query(F.data == "adm_reviews")
 async def cb_adm_reviews(cb: CallbackQuery):
@@ -1080,31 +1274,6 @@ async def cb_adm_rev_del(cb: CallbackQuery):
     await _next_review(cb)
 
 
-# ── Команда /book_ID — управление конкретной записью ─────────────────────────
-
-@admin_fsm_router.message(Command(re.compile(r"book_(\d+)")))
-async def cmd_book_id(message: Message, bot: Bot):
-    if not is_admin(message.from_user.id): return
-    bid     = int(message.text.split("_")[1])
-    booking = await db_get_booking(bid)
-    if not booking:
-        await message.answer("Запись не найдена.")
-        return
-    name  = booking["first_name"] or "Аноним"
-    uname = f" (@{booking['username']})" if booking["username"] else ""
-    dt    = fmt_dt(booking["appt_dt"]) if booking["appt_dt"] else booking["datetime_txt"]
-    status_map = {"pending":"⏳ Ожидает","confirmed":"✅ Подтверждена","cancelled":"❌ Отменена"}
-    status = status_map.get(booking["status"], booking["status"])
-    await message.answer(
-        f"📋 <b>Запись #{bid}</b>\n\n"
-        f"👤 <b>{name}</b>{uname}\n"
-        f"💇‍♀️ {booking['service_name']}\n"
-        f"📅 {dt}\n"
-        f"Статус: {status}",
-        reply_markup=kb_booking_confirmed(bid) if booking["status"] == "confirmed" else kb_booking_moderate(bid)
-    )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  ADMIN — FSM ВВОД
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1139,40 +1308,73 @@ async def fsm_svc_text(message: Message, state: FSMContext):
         reply_markup=kb_svc_list()
     )
 
-@admin_fsm_router.message(AdminFSM.confirm_booking)
-async def fsm_confirm_booking(message: Message, state: FSMContext, bot: Bot):
+@admin_fsm_router.message(F.text)
+async def fsm_manual_date_input(message: Message, bot: Bot):
+    """
+    Ловим ввод даты вручную если автоопределение не сработало.
+    Используется только если в settings есть pending_confirm_bid.
+    """
+    if not is_admin(message.from_user.id):
+        return
+    # Проверяем есть ли ожидающее подтверждение
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT value FROM settings WHERE key='pending_confirm_bid'")
+        row = await cur.fetchone()
+    if not row:
+        return
+
+    bid  = int(row[0])
     text = (message.text or "").strip()
-    dt   = parse_dt(text)
+
+    # Пробуем распознать дату
+    dt = parse_dt_from_text(text)
+    if not dt:
+        # Попробуем строго
+        for fmt in ("%d.%m.%Y %H:%M", "%d.%m %H:%M"):
+            try:
+                dt = datetime.strptime(text, fmt)
+                if fmt == "%d.%m %H:%M":
+                    dt = dt.replace(year=datetime.now().year)
+                break
+            except: pass
+
     if not dt:
         await message.answer(
             "⚠️ Не удалось распознать дату.\n"
             "Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\nПример: <code>15.01.2025 14:00</code>"
         )
         return
-    data    = await state.get_data()
-    bid     = data.get("confirming_id")
-    uid     = data.get("confirming_uid")
-    service = data.get("confirming_service")
-    await state.clear()
-    await db_confirm_booking(bid, dt.isoformat())
-    dt_fmt = fmt_dt(dt.isoformat())
 
-    # Уведомление клиенту
+    booking = await db_get_booking(bid)
+    if not booking:
+        await message.answer("Запись не найдена.")
+        return
+
+    await db_confirm_booking(bid, dt.isoformat())
+    # Очищаем временный флаг
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM settings WHERE key='pending_confirm_bid'")
+        await db.commit()
+
+    dt_fmt = fmt_dt(dt.isoformat())
+    active = reminder_label()
+
     try:
         await bot.send_message(
-            uid,
+            booking["user_id"],
             f"🎉 <b>Ваша запись подтверждена!</b>\n\n"
-            f"💇‍♀️ Услуга: <b>{service}</b>\n"
+            f"💇‍♀️ Услуга: <b>{booking['service_name']}</b>\n"
             f"📅 Дата и время: <b>{dt_fmt}</b>\n"
             f"✂️ Мастер: <b>{MASTER_NAME_FULL}</b>\n\n"
-            f"Вам придут напоминания за 24ч, 6ч и 1ч до визита.\n"
+            f"Напоминания придут автоматически ({active}).\n"
             f"<i>Если нужно перенести — напишите мастеру.</i>"
         )
     except: pass
 
     await message.answer(
-        f"✅ <b>Запись #{bid} подтверждена!</b>\n\nУслуга: <b>{service}</b>\nДата: <b>{dt_fmt}</b>\n\n"
-        f"Клиент уведомлён. Напоминания пойдут автоматически.",
+        f"✅ <b>Запись #{bid} подтверждена!</b>\n\n"
+        f"💇‍♀️ {booking['service_name']}\n📅 {dt_fmt}\n\n"
+        f"Клиент уведомлён. Напоминания: {active}.",
         reply_markup=kb_admin_main()
     )
 
@@ -1194,27 +1396,43 @@ async def reminder_worker(bot: Bot):
                 bid  = b["id"]
                 dtf  = fmt_dt(b["appt_dt"])
 
-                if not b["reminded_24"] and 23.5 <= diff <= 24.5:
+                # За 24 часа
+                if REMINDER_SETTINGS["r24"] and not b["reminded_24"] and 23.5 <= diff <= 24.5:
                     try:
                         await bot.send_message(uid,
                             f"🔔 <b>Напоминание!</b>\n\nЗавтра у вас запись:\n"
-                            f"💇‍♀️ <b>{svc}</b>\n📅 <b>{dtf}</b>\n\n<i>Ждём вас! 🌸</i>")
+                            f"💇‍♀️ <b>{svc}</b>\n📅 <b>{dtf}</b>\n\n"
+                            f"<i>Ждём вас! 🌸</i>")
                         await db_mark_reminded(bid, "reminded_24")
                     except: pass
 
-                elif not b["reminded_6"] and 5.5 <= diff <= 6.5:
+                # За 12 часов
+                elif REMINDER_SETTINGS["r12"] and not b["reminded_12"] and 11.5 <= diff <= 12.5:
+                    try:
+                        await bot.send_message(uid,
+                            f"⏰ <b>Напоминание!</b>\n\nЧерез 12 часов:\n"
+                            f"💇‍♀️ <b>{svc}</b>\n📅 <b>{dtf}</b>\n\n"
+                            f"<i>Не забудьте! 💫</i>")
+                        await db_mark_reminded(bid, "reminded_12")
+                    except: pass
+
+                # За 6 часов
+                elif REMINDER_SETTINGS["r6"] and not b["reminded_6"] and 5.5 <= diff <= 6.5:
                     try:
                         await bot.send_message(uid,
                             f"⏰ <b>Напоминание!</b>\n\nЧерез 6 часов:\n"
-                            f"💇‍♀️ <b>{svc}</b>\n📅 <b>{dtf}</b>\n\n<i>Не забудьте! 💫</i>")
+                            f"💇‍♀️ <b>{svc}</b>\n📅 <b>{dtf}</b>\n\n"
+                            f"<i>Скоро увидимся! ✨</i>")
                         await db_mark_reminded(bid, "reminded_6")
                     except: pass
 
-                elif not b["reminded_1"] and 0.75 <= diff <= 1.25:
+                # За 1 час
+                elif REMINDER_SETTINGS["r1"] and not b["reminded_1"] and 0.75 <= diff <= 1.25:
                     try:
                         await bot.send_message(uid,
                             f"⚡ <b>Напоминание!</b>\n\nЧерез 1 час:\n"
-                            f"💇‍♀️ <b>{svc}</b>\n📅 <b>{dtf}</b>\n\n<i>Выезжайте! 🚀</i>")
+                            f"💇‍♀️ <b>{svc}</b>\n📅 <b>{dtf}</b>\n\n"
+                            f"<i>Выезжайте! 🚀</i>")
                         await db_mark_reminded(bid, "reminded_1")
                     except: pass
 
@@ -1226,8 +1444,6 @@ async def reminder_worker(bot: Bot):
 # ══════════════════════════════════════════════════════════════════════════════
 #  ТОЧКА ВХОДА
 # ══════════════════════════════════════════════════════════════════════════════
-
-import re
 
 async def main():
     log.info("Запуск бота...")
