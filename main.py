@@ -28,7 +28,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN        = "ВАШ_ТОКЕН"                   # токен от @BotFather
+BOT_TOKEN        = "8744002494:AAEKlQI_u7ovICGCvNknXR_UnrXEig0Vj2A"                   # токен от @BotFather
 ADMIN_ID         = 123456789                       # ваш Telegram ID
 SCHEDULE_CHANNEL = "@канал_расписания"             # канал куда бот пишет записи
 CHANNEL_ID       = "@канал_подписки"              # канал подписки для клиентов
