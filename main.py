@@ -23,21 +23,21 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
-import os
 
-load_dotenv()
+
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN          = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
-ADMIN_ID           = int(os.getenv("ADMIN_ID", "123456789"))
-SCHEDULE_CHANNEL   = os.getenv("SCHEDULE_CHANNEL_ID", "@schedule_channel")
-CHANNEL_ID         = os.getenv("CHANNEL_ID", "@your_channel")
-CHANNEL_LINK       = os.getenv("CHANNEL_LINK", "https://t.me/your_channel")
-DB_PATH            = os.getenv("DB_PATH", "manicure.db")
+BOT_TOKEN        = "8744002494:AAEKlQI_u7ovICGCvNknXR_UnrXEig0Vj2A"          # токен от @BotFather
+ADMIN_ID         = 123456789                   # ваш Telegram ID (узнать у @userinfobot)
+SCHEDULE_CHANNEL = "@канал_расписания"         # канал куда бот пишет записи
+CHANNEL_ID       = "@канал_подписки"           # канал подписки для клиентов
+CHANNEL_LINK     = "https://t.me/ваш_канал"   # ссылка на канал подписки
+DB_PATH          = "manicure.db"               # файл БД (не менять)
 
 # Слоты по умолчанию при добавлении нового рабочего дня
 DEFAULT_SLOTS = [
