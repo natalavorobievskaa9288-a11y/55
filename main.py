@@ -2,17 +2,17 @@
 Telegram-бот для записи к мастеру — Полина Евдокимова.
 Aiogram 3 · SQLite (aiosqlite)
 
-v7 — УПРОЩЁННАЯ ВЕРСИЯ:
-✅ Кнопка «Записаться» → выбор услуги → ссылка в @Evdokimkaaa с готовым текстом
-✅ Убрана вся FSM-логика (слоты, даты, телефон, подтверждение)
-✅ Убрана обязательная подписка на канал
-✅ Админ-панель: только рассылка + просмотр пользователей
-✅ Убраны напоминания, планировщик, блокировка дней
+v9:
+✅ Авторизация админа сохраняется в БД — не слетает при перезапуске
+✅ Пользователи не теряются из базы никогда
+✅ Тексты услуг меняются сразу для всех клиентов
+✅ Исправлен подсчёт пользователей
 """
 
 import asyncio
 import logging
 import json
+import urllib.parse
 import aiosqlite
 
 from datetime import datetime
@@ -107,12 +107,12 @@ class SQLiteFSMStorage(BaseStorage):
 #  КОНФИГУРАЦИЯ  ←  ЗАПОЛНИТЕ ПЕРЕД ЗАПУСКОМ
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN      = "8386414173:AAEy5JnqOpqKvT72RQi8NeoMx7tk9xxEJyk"       # токен от @BotFather
-ADMIN_ID       = 123456789          # ваш Telegram ID (@userinfobot)
+BOT_TOKEN      = "ВАШ_ТОКЕН"
+ADMIN_ID       = 123456789
 DB_PATH        = "manicure.db"
 ADMIN_PASSWORD = "adinspalina999"
 
-MASTER_USERNAME = "Evdokimkaaa"     # без @
+MASTER_USERNAME  = "Evdokimkaaa"
 MASTER_NAME_FULL = "Полина Евдокимова"
 PORTFOLIO_LINK   = "https://t.me/evdokimovapolinatg"
 
@@ -128,8 +128,17 @@ SERVICES = [
     ("Укладка локоны",                   "2 500 – 3 500 ₽"),
 ]
 
-# Список авторизованных через пароль (сбрасывается при перезапуске)
-ADMIN_AUTHED: set[int] = set()
+DEFAULT_SERVICE_TEXTS = [
+    "Здравствуйте, я с бота по записи, хочу записаться на сложное окрашивание",
+    "Здравствуйте, я с бота по записи, хочу записаться в один тон",
+    "Здравствуйте, я с бота по записи, хочу записаться на окрашивание корней",
+    "Здравствуйте, я с бота по записи, хочу записаться на тонирование блонда",
+    "Здравствуйте, я с бота по записи, хочу записаться на осветление корней + тонирование",
+    "Здравствуйте, я с бота по записи, хочу записаться на глубокий контуринг",
+    "Здравствуйте, я с бота по записи, хочу записаться на стрижку",
+    "Здравствуйте, я с бота по записи, хочу записаться на укладку (брашинг)",
+    "Здравствуйте, я с бота по записи, хочу записаться на укладку локонами",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,18 +161,33 @@ async def init_db():
                 first_name TEXT,
                 created_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS service_texts (
+                svc_index   INTEGER PRIMARY KEY,
+                custom_text TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                user_id   INTEGER PRIMARY KEY,
+                authed_at TEXT NOT NULL
+            );
         """)
         await db.commit()
     log.info("БД готова.")
 
 
+# ── Пользователи ──────────────────────────────────────────────────────────────
+
 async def db_save_user(user_id: int, username: str | None, first_name: str | None):
+    """Сохраняет нового пользователя. Уже существующих не трогает (дата сохраняется)."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT OR REPLACE INTO users (user_id, username, first_name, created_at)
-               VALUES (?,?,?,COALESCE((SELECT created_at FROM users WHERE user_id=?), ?))""",
-            (user_id, username, first_name, user_id, datetime.now().isoformat())
-        )
+        await db.execute("""
+            INSERT INTO users (user_id, username, first_name, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username   = excluded.username,
+                first_name = excluded.first_name
+        """, (user_id, username, first_name, datetime.now().isoformat()))
         await db.commit()
 
 
@@ -183,18 +207,70 @@ async def db_get_all_user_ids() -> list[int]:
         return [r[0] for r in await cur.fetchall()]
 
 
+async def db_count_users() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM users")
+        row = await cur.fetchone()
+    return row[0] if row else 0
+
+
+# ── Тексты услуг ──────────────────────────────────────────────────────────────
+
+async def db_get_service_text(svc_index: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT custom_text FROM service_texts WHERE svc_index=?", (svc_index,)
+        )
+        row = await cur.fetchone()
+    return row[0] if row else DEFAULT_SERVICE_TEXTS[svc_index]
+
+
+async def db_set_service_text(svc_index: int, text: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO service_texts (svc_index, custom_text) VALUES (?,?)",
+            (svc_index, text)
+        )
+        await db.commit()
+
+
+async def db_reset_service_text(svc_index: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM service_texts WHERE svc_index=?", (svc_index,))
+        await db.commit()
+
+
+# ── Постоянная авторизация админов ───────────────────────────────────────────
+
+async def db_admin_add(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO admin_sessions (user_id, authed_at) VALUES (?,?)",
+            (user_id, datetime.now().isoformat())
+        )
+        await db.commit()
+
+
+async def db_admin_check(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM admin_sessions WHERE user_id=?", (user_id,)
+        )
+        return await cur.fetchone() is not None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ХЭЛПЕРЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID or user_id in ADMIN_AUTHED
+async def is_admin(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    return await db_admin_check(user_id)
 
 
-def make_master_link(service_name: str) -> str:
-    """Ссылка на мастера с готовым текстом в поле ввода."""
-    import urllib.parse
-    text = f"Здравствуйте, я с бота по записи, хочу записаться на {service_name}"
+async def make_master_link(svc_index: int) -> str:
+    text    = await db_get_service_text(svc_index)
     encoded = urllib.parse.quote(text)
     return f"https://t.me/{MASTER_USERNAME}?text={encoded}"
 
@@ -207,26 +283,29 @@ class AdminFSM(StatesGroup):
     password          = State()
     broadcast_msg     = State()
     broadcast_confirm = State()
+    edit_svc_text     = State()
 
 
 class IsAdmin(Filter):
     async def __call__(self, event: TelegramObject) -> bool:
         uid = getattr(getattr(event, "from_user", None), "id", None)
-        return is_admin(uid)
+        if uid is None:
+            return False
+        return await is_admin(uid)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  КЛАВИАТУРЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
-def kb_main_menu(user_id: int = 0) -> InlineKeyboardMarkup:
+async def kb_main_menu(user_id: int = 0) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="📅 Записаться",   callback_data="book_start"))
+    b.row(InlineKeyboardButton(text="📅 Записаться",  callback_data="book_start"))
     b.row(
-        InlineKeyboardButton(text="💰 Прайс-лист",  callback_data="prices"),
-        InlineKeyboardButton(text="🌸 Портфолио",   callback_data="portfolio"),
+        InlineKeyboardButton(text="💰 Прайс-лист", callback_data="prices"),
+        InlineKeyboardButton(text="🌸 Портфолио",  callback_data="portfolio"),
     )
-    if is_admin(user_id):
+    if await is_admin(user_id):
         b.row(InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel"))
     return b.as_markup()
 
@@ -259,11 +338,11 @@ def kb_services() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def kb_write_to_master(service_name: str) -> InlineKeyboardMarkup:
+async def kb_write_to_master(svc_index: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(
         text="✍️ Написать мастеру",
-        url=make_master_link(service_name)
+        url=await make_master_link(svc_index)
     ))
     b.row(InlineKeyboardButton(text="🔙 Выбрать другую услугу", callback_data="book_start"))
     b.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"))
@@ -272,9 +351,10 @@ def kb_write_to_master(service_name: str) -> InlineKeyboardMarkup:
 
 def kb_admin_main() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="👥 Список пользователей",   callback_data="adm_users"))
-    b.row(InlineKeyboardButton(text="📣 Рассылка всем клиентам", callback_data="adm_broadcast"))
-    b.row(InlineKeyboardButton(text="🔙 Главное меню",           callback_data="main_menu"))
+    b.row(InlineKeyboardButton(text="👥 Список пользователей",    callback_data="adm_users"))
+    b.row(InlineKeyboardButton(text="📣 Рассылка всем клиентам",  callback_data="adm_broadcast"))
+    b.row(InlineKeyboardButton(text="✏️ Тексты для записи",       callback_data="adm_svc_texts"))
+    b.row(InlineKeyboardButton(text="🔙 Главное меню",            callback_data="main_menu"))
     return b.as_markup()
 
 
@@ -284,6 +364,28 @@ def kb_broadcast_confirm() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✅ Отправить", callback_data="adm_do_broadcast"),
         InlineKeyboardButton(text="❌ Отмена",    callback_data="admin_panel"),
     )
+    return b.as_markup()
+
+
+def kb_svc_texts_list() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for i, (name, _) in enumerate(SERVICES):
+        b.button(text=name, callback_data=f"adm_edit_svc:{i}")
+    b.adjust(1)
+    b.row(InlineKeyboardButton(text="🔙 Панель администратора", callback_data="admin_panel"))
+    return b.as_markup()
+
+
+def kb_svc_text_edit(svc_index: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(
+        text="🔄 Сбросить на стандартный",
+        callback_data=f"adm_reset_svc:{svc_index}"
+    ))
+    b.row(InlineKeyboardButton(
+        text="❌ Отменить редактирование",
+        callback_data="adm_svc_texts"
+    ))
     return b.as_markup()
 
 
@@ -321,10 +423,10 @@ PRICES_TEXT = (
 #  РОУТЕРЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
-auth_router     = Router()
-common_router   = Router()
-user_router     = Router()
-admin_cb_router = Router()
+auth_router      = Router()
+common_router    = Router()
+user_router      = Router()
+admin_cb_router  = Router()
 admin_fsm_router = Router()
 
 admin_cb_router.callback_query.filter(IsAdmin())
@@ -336,7 +438,7 @@ admin_cb_router.callback_query.filter(IsAdmin())
 
 @auth_router.message(Command("admin"))
 async def cmd_admin_entry(message: Message, state: FSMContext):
-    if is_admin(message.from_user.id):
+    if await is_admin(message.from_user.id):
         await state.clear()
         await message.answer("🛠 <b>Панель администратора</b>", reply_markup=kb_admin_main())
         return
@@ -346,15 +448,18 @@ async def cmd_admin_entry(message: Message, state: FSMContext):
 
 @auth_router.message(AdminFSM.password)
 async def fsm_admin_password(message: Message, state: FSMContext):
-    if message.text.strip() == ADMIN_PASSWORD:
-        ADMIN_AUTHED.add(message.from_user.id)
+    if message.text and message.text.strip() == ADMIN_PASSWORD:
+        # ✅ Записываем в БД — навсегда, не слетает при перезапуске бота
+        await db_admin_add(message.from_user.id)
         await state.clear()
         try:
             await message.delete()
         except Exception:
             pass
         await message.answer(
-            "✅ <b>Доступ разрешён!</b>\n\n🛠 <b>Панель администратора</b>",
+            "✅ <b>Доступ разрешён!</b>\n"
+            "<i>Вы навсегда добавлены как администратор — пароль больше вводить не нужно.</i>\n\n"
+            "🛠 <b>Панель администратора</b>",
             reply_markup=kb_admin_main()
         )
     else:
@@ -371,14 +476,14 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user = message.from_user
     await db_save_user(user.id, user.username, user.first_name)
-    await message.answer(WELCOME, reply_markup=kb_main_menu(user.id))
+    await message.answer(WELCOME, reply_markup=await kb_main_menu(user.id))
 
 
 @common_router.callback_query(F.data == "main_menu")
 async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
-    await cb.message.edit_text(WELCOME, reply_markup=kb_main_menu(cb.from_user.id))
+    await cb.message.edit_text(WELCOME, reply_markup=await kb_main_menu(cb.from_user.id))
 
 
 @common_router.callback_query(F.data == "prices")
@@ -423,7 +528,7 @@ async def cb_book_service(cb: CallbackQuery):
         f"<b>{service_name}</b>  —  {service_price}\n\n"
         f"Нажмите кнопку ниже — откроется чат с мастером.\n"
         f"Сообщение уже будет заполнено, просто нажмите <b>Отправить</b>! 👇",
-        reply_markup=kb_write_to_master(service_name)
+        reply_markup=await kb_write_to_master(idx)
     )
 
 
@@ -442,21 +547,19 @@ async def cb_admin_panel(cb: CallbackQuery, state: FSMContext):
 async def cb_adm_users(cb: CallbackQuery):
     await cb.answer()
     users = await db_get_all_users()
+    total = len(users)
+
     if not users:
-        await cb.message.edit_text(
-            "👥 <b>Пользователей пока нет.</b>",
-            reply_markup=kb_admin_back()
-        )
+        await cb.message.edit_text("👥 <b>Пользователей пока нет.</b>", reply_markup=kb_admin_back())
         return
 
-    lines = [f"👥 <b>Пользователи бота: {len(users)} чел.</b>\n"]
-    for u in users[:50]:   # показываем первые 50
+    lines = [f"👥 <b>Всего пользователей: {total} чел.</b>\n"]
+    for u in users[:50]:
         uname = f"@{u['username']}" if u["username"] else f"ID {u['user_id']}"
         name  = u["first_name"] or "—"
         lines.append(f"• {name} — {uname}")
-
-    if len(users) > 50:
-        lines.append(f"\n<i>...и ещё {len(users)-50} пользователей</i>")
+    if total > 50:
+        lines.append(f"\n<i>...и ещё {total - 50} пользователей</i>")
 
     await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_back())
 
@@ -464,11 +567,11 @@ async def cb_adm_users(cb: CallbackQuery):
 @admin_cb_router.callback_query(F.data == "adm_broadcast")
 async def cb_adm_broadcast(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    user_ids = await db_get_all_user_ids()
+    total = await db_count_users()
     await state.set_state(AdminFSM.broadcast_msg)
     await cb.message.edit_text(
         f"📣 <b>Рассылка</b>\n\n"
-        f"Получателей: <b>{len(user_ids)}</b>\n\n"
+        f"Получателей: <b>{total} чел.</b>\n\n"
         f"Введите текст рассылки.\n"
         f"Поддерживается HTML: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>",
         reply_markup=kb_admin_back()
@@ -506,6 +609,55 @@ async def cb_adm_do_broadcast(cb: CallbackQuery, state: FSMContext, bot: Bot):
     )
 
 
+# ── Редактор текстов услуг ────────────────────────────────────────────────────
+
+@admin_cb_router.callback_query(F.data == "adm_svc_texts")
+async def cb_adm_svc_texts(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    await cb.message.edit_text(
+        "✏️ <b>Редактирование авто-текстов</b>\n\n"
+        "Выберите услугу — изменения сразу применяются для <b>всех</b> пользователей:",
+        reply_markup=kb_svc_texts_list()
+    )
+
+
+@admin_cb_router.callback_query(F.data.startswith("adm_edit_svc:"))
+async def cb_adm_edit_svc(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    idx         = int(cb.data.split(":")[1])
+    svc_name    = SERVICES[idx][0]
+    current     = await db_get_service_text(idx)
+    is_custom   = (current != DEFAULT_SERVICE_TEXTS[idx])
+    status      = "🟡 изменён вами" if is_custom else "🟢 стандартный"
+
+    await state.set_state(AdminFSM.edit_svc_text)
+    await state.update_data(editing_svc_index=idx)
+
+    await cb.message.edit_text(
+        f"✏️ <b>Редактирование: «{svc_name}»</b>\n\n"
+        f"Статус: <i>{status}</i>\n\n"
+        f"<b>Текущий текст:</b>\n"
+        f"<code>{current}</code>\n\n"
+        f"Напишите новый текст — он появится у всех клиентов при записи на эту услугу.",
+        reply_markup=kb_svc_text_edit(idx)
+    )
+
+
+@admin_cb_router.callback_query(F.data.startswith("adm_reset_svc:"))
+async def cb_adm_reset_svc(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    idx      = int(cb.data.split(":")[1])
+    svc_name = SERVICES[idx][0]
+    await db_reset_service_text(idx)
+    await state.clear()
+    await cb.message.edit_text(
+        f"✅ <b>Текст для «{svc_name}» сброшен на стандартный:</b>\n\n"
+        f"<code>{DEFAULT_SERVICE_TEXTS[idx]}</code>",
+        reply_markup=kb_svc_texts_list()
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ADMIN — FSM ТЕКСТОВЫЙ ВВОД
 # ══════════════════════════════════════════════════════════════════════════════
@@ -515,12 +667,38 @@ async def fsm_broadcast_msg(message: Message, state: FSMContext):
     text = message.text or ""
     await state.update_data(broadcast_text=text)
     await state.set_state(AdminFSM.broadcast_confirm)
-    user_ids = await db_get_all_user_ids()
+    total = await db_count_users()
     await message.answer(
         f"📣 <b>Предпросмотр рассылки:</b>\n\n"
         f"{'─'*28}\n{text}\n{'─'*28}\n\n"
-        f"Отправить <b>{len(user_ids)}</b> пользователям?",
+        f"Отправить <b>{total}</b> пользователям?",
         reply_markup=kb_broadcast_confirm()
+    )
+
+
+@admin_fsm_router.message(AdminFSM.edit_svc_text)
+async def fsm_edit_svc_text(message: Message, state: FSMContext):
+    new_text = (message.text or "").strip()
+    if not new_text:
+        await message.answer("⚠️ Текст не может быть пустым. Попробуйте ещё раз:")
+        return
+
+    data = await state.get_data()
+    idx  = data.get("editing_svc_index")
+    if idx is None:
+        await state.clear()
+        await message.answer("Ошибка. Попробуйте снова.", reply_markup=kb_admin_main())
+        return
+
+    await db_set_service_text(idx, new_text)
+    await state.clear()
+
+    svc_name = SERVICES[idx][0]
+    await message.answer(
+        f"✅ <b>Готово! Текст для «{svc_name}» обновлён для всех пользователей.</b>\n\n"
+        f"<b>Новый текст:</b>\n"
+        f"<code>{new_text}</code>",
+        reply_markup=kb_svc_texts_list()
     )
 
 
