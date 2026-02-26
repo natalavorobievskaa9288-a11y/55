@@ -2,14 +2,13 @@
 Telegram-бот для записи к мастеру — Полина Евдокимова.
 Aiogram 3 · SQLite (aiosqlite) · APScheduler
 
-ИСПРАВЛЕНИЯ v4:
-✅ cb.answer() вызывается ПЕРВЫМ — кнопки больше не зависают
-✅ Отдельный роутер для FSM-ввода администратора (без IsAdmin-фильтра)
-   → ввод даты/времени работает всегда, даже после перезапуска бота
-✅ Красивое уведомление клиенту и администратору при записи
-✅ Двойная запись физически невозможна (BEGIN EXCLUSIVE)
-✅ Данные хранятся в SQLite — не пропадают при перезапуске
-✅ drop_pending_updates=True — старые сообщения при старте игнорируются
+ИСПРАВЛЕНИЯ v5:
+✅ ГЛАВНЫЙ БАГ ИСПРАВЛЕН: book_slot callback содержал "17:00" → split(":") давал 4 части
+   вместо 3 → бот зависал. Теперь время парсится корректно.
+✅ Порядок ввода изменён: сначала ТЕЛЕФОН, потом ИМЯ (как и просили)
+✅ Настройка количества напоминаний в админ-панели (1/2/3/4 раза за 24ч)
+✅ Проверка подписки на https://t.me/evdokimovapolinatg
+✅ Все остальные исправления из v4 сохранены
 """
 
 import asyncio
@@ -37,11 +36,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 #  КОНФИГУРАЦИЯ  ←  ЗАПОЛНИТЕ ПЕРЕД ЗАПУСКОМ
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN        = "8744002494:AAEKlQI_u7ovICGCvNknXR_UnrXEig0Vj2A"               # токен от @BotFather
+BOT_TOKEN        = "ВАШ_ТОКЕН"               # токен от @BotFather
 ADMIN_ID         = 123456789                   # ваш Telegram ID (@userinfobot)
 SCHEDULE_CHANNEL = ""                          # "@channel" или "" чтобы отключить
-CHANNEL_ID       = "@evdokimovapolinatg"                          # "@channel" или "" чтобы отключить проверку подписки
-CHANNEL_LINK     = "https://t.me/ваш_канал"
+CHANNEL_ID       = "@evdokimovapolinatg"       # канал для проверки подписки
+CHANNEL_LINK     = "https://t.me/evdokimovapolinatg"
 DB_PATH          = "manicure.db"
 ADMIN_PASSWORD   = "adinspalina999"
 
@@ -69,9 +68,11 @@ MONTHS_RU   = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель"
                11:"Ноябрь",12:"Декабрь"}
 WEEKDAYS_RU = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
 
-# Список авторизованных через пароль (сбрасывается при перезапуске —
-# для постоянного доступа задайте ADMIN_ID)
+# Список авторизованных через пароль (сбрасывается при перезапуске)
 ADMIN_AUTHED: set[int] = set()
+
+# Количество напоминаний по умолчанию (хранится и в БД)
+DEFAULT_REMINDER_COUNT = 1   # 1 = за 24ч до, 2 = за 24ч и 12ч, и т.д.
 
 scheduler: AsyncIOScheduler | None = None
 
@@ -115,15 +116,50 @@ async def init_db():
                 username   TEXT,
                 first_name TEXT
             );
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
-        # миграция: добавить service если нет
-        try:
-            await db.execute("ALTER TABLE bookings ADD COLUMN service TEXT")
-            await db.commit()
-        except Exception:
-            pass
+        # миграции
+        for col_sql in [
+            "ALTER TABLE bookings ADD COLUMN service TEXT",
+        ]:
+            try:
+                await db.execute(col_sql)
+                await db.commit()
+            except Exception:
+                pass
+        # дефолтные настройки
+        await db.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('reminder_count', ?)",
+            (str(DEFAULT_REMINDER_COUNT),)
+        )
         await db.commit()
     log.info("БД готова.")
+
+
+async def db_get_setting(key: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def db_set_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value)
+        )
+        await db.commit()
+
+
+async def get_reminder_count() -> int:
+    val = await db_get_setting("reminder_count")
+    try:
+        return max(1, min(4, int(val or DEFAULT_REMINDER_COUNT)))
+    except Exception:
+        return DEFAULT_REMINDER_COUNT
 
 
 async def db_save_user(user_id: int, username: str | None, first_name: str | None):
@@ -350,6 +386,21 @@ async def db_is_day_blocked(slot_date: str) -> bool:
 #  ПЛАНИРОВЩИК НАПОМИНАНИЙ
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _reminder_offsets(count: int) -> list[int]:
+    """
+    Возвращает список смещений в часах ДО визита для count напоминаний.
+    count=1 → [24]
+    count=2 → [24, 12]
+    count=3 → [24, 16, 8]
+    count=4 → [24, 18, 12, 6]
+    """
+    if count == 1: return [24]
+    if count == 2: return [24, 12]
+    if count == 3: return [24, 16, 8]
+    if count == 4: return [24, 18, 12, 6]
+    return [24]
+
+
 async def _send_reminder(bot: Bot, user_id: int, first_name: str,
                          service: str, visit_time: str, booking_id: int):
     try:
@@ -360,9 +411,10 @@ async def _send_reminder(bot: Bot, user_id: int, first_name: str,
         )
         await bot.send_message(
             user_id,
-            f"👋 <b>{first_name}</b>, вы записаны на завтра:\n\n"
+            f"👋 <b>{first_name}</b>, напоминаем о вашей записи:\n\n"
             f"🕐 <b>{visit_time}</b> — {service}\n"
-            f"к <b>{MASTER_NAME_FULL}</b>\n\n"
+            f"к <b>{MASTER_NAME_FULL}</b>\n"
+            f"📍 {MASTER_ADDRESS}\n\n"
             f"Ваш визит остаётся в силе?",
             parse_mode="HTML",
             reply_markup=kb.as_markup()
@@ -372,25 +424,39 @@ async def _send_reminder(bot: Bot, user_id: int, first_name: str,
 
 
 def sched_add(bot: Bot, booking_id: int, user_id: int,
-              first_name: str, service: str, visit_dt: datetime):
+              first_name: str, service: str, visit_dt: datetime,
+              reminder_count: int = 1):
     global scheduler
     if not scheduler:
         return
-    remind_at = visit_dt - timedelta(hours=24)
-    if remind_at <= datetime.now():
-        return
-    scheduler.add_job(
-        _send_reminder, trigger="date", run_date=remind_at,
-        args=[bot, user_id, first_name, service, visit_dt.strftime("%H:%M"), booking_id],
-        id=f"rem_{booking_id}", replace_existing=True
-    )
-    log.info(f"Напоминание #{booking_id} → {remind_at:%Y-%m-%d %H:%M}")
+    offsets = _reminder_offsets(reminder_count)
+    now = datetime.now()
+    added = 0
+    for i, hours in enumerate(offsets):
+        remind_at = visit_dt - timedelta(hours=hours)
+        if remind_at <= now:
+            continue
+        job_id = f"rem_{booking_id}_{i}"
+        scheduler.add_job(
+            _send_reminder, trigger="date", run_date=remind_at,
+            args=[bot, user_id, first_name, service,
+                  visit_dt.strftime("%H:%M"), booking_id],
+            id=job_id, replace_existing=True
+        )
+        added += 1
+        log.info(f"Напоминание #{booking_id}[{i}] → {remind_at:%Y-%m-%d %H:%M} (за {hours}ч)")
+    if added == 0:
+        log.info(f"Напоминание #{booking_id}: все сроки уже прошли, не добавлено")
 
 
 def sched_remove(booking_id: int):
     global scheduler
-    if scheduler and scheduler.get_job(f"rem_{booking_id}"):
-        scheduler.remove_job(f"rem_{booking_id}")
+    if not scheduler:
+        return
+    for i in range(4):
+        job_id = f"rem_{booking_id}_{i}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
 
 
 async def restore_reminders(bot: Bot):
@@ -398,13 +464,15 @@ async def restore_reminders(bot: Bot):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id, first_name FROM users")
         users_map = {r[0]: r[1] for r in await cur.fetchall()}
+    reminder_count = await get_reminder_count()
     n = 0
     for b in bookings:
         try:
             visit_dt   = datetime.strptime(f"{b['date']} {b['time']}", "%Y-%m-%d %H:%M")
             first_name = users_map.get(b["user_id"]) or b["name"]
             sched_add(bot, b["booking_id"], b["user_id"],
-                      first_name, b.get("service") or "Услуга", visit_dt)
+                      first_name, b.get("service") or "Услуга",
+                      visit_dt, reminder_count)
             n += 1
         except Exception as e:
             log.error(f"restore #{b['booking_id']}: {e}")
@@ -450,22 +518,23 @@ class BookFSM(StatesGroup):
     service = State()
     date    = State()
     time    = State()
-    name    = State()
-    phone   = State()
+    phone   = State()   # ← ТЕЛЕФОН ПЕРВЫЙ
+    name    = State()   # ← ИМЯ ВТОРЫМ
     confirm = State()
 
 
 class AdminFSM(StatesGroup):
-    password          = State()
-    add_day_date      = State()
-    add_slot_date     = State()
-    add_slot_time     = State()
-    del_slot_date     = State()
-    block_day_date    = State()
-    schedule_date     = State()
-    cancel_book_date  = State()
-    broadcast_msg     = State()
-    broadcast_confirm = State()
+    password            = State()
+    add_day_date        = State()
+    add_slot_date       = State()
+    add_slot_time       = State()
+    del_slot_date       = State()
+    block_day_date      = State()
+    schedule_date       = State()
+    cancel_book_date    = State()
+    broadcast_msg       = State()
+    broadcast_confirm   = State()
+    set_reminder_count  = State()   # ← новое состояние
 
 
 class IsAdmin(Filter):
@@ -529,7 +598,15 @@ def kb_services() -> InlineKeyboardMarkup:
 def kb_time_slots(slots: list[dict]) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for s in slots:
-        b.button(text=f"🕐 {s['time']}", callback_data=f"book_slot:{s['id']}:{s['time']}")
+        # ═══════════════════════════════════════════════════════════════════
+        # ИСПРАВЛЕНИЕ ГЛАВНОГО БАГА:
+        # Раньше: callback_data = "book_slot:{id}:{time}" → "book_slot:5:17:00"
+        # split(":") давал 4 части → _ , sid, stime = ... → ValueError → зависание
+        # Теперь: время передаём без двоеточия: "1700" вместо "17:00"
+        # Восстанавливаем формат при получении: "1700" → "17:00"
+        # ═══════════════════════════════════════════════════════════════════
+        time_key = s['time'].replace(":", "")   # "17:00" → "1700"
+        b.button(text=f"🕐 {s['time']}", callback_data=f"bslot:{s['id']}:{time_key}")
     b.adjust(3)
     b.row(InlineKeyboardButton(text="🔙 К календарю", callback_data="back_to_calendar"))
     return b.as_markup()
@@ -606,8 +683,27 @@ def kb_admin_main() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📋 Расписание",      callback_data="adm_schedule"),
     )
     b.row(InlineKeyboardButton(text="❌ Отменить запись клиента",  callback_data="adm_cancel_booking"))
+    b.row(InlineKeyboardButton(text="🔔 Настройка напоминаний",   callback_data="adm_reminder_settings"))
     b.row(InlineKeyboardButton(text="📣 Рассылка всем клиентам",  callback_data="adm_broadcast"))
     b.row(InlineKeyboardButton(text="🔙 Главное меню",            callback_data="main_menu"))
+    return b.as_markup()
+
+
+def kb_reminder_settings(current: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    options = [
+        (1, "1️⃣ Одно (за 24ч)"),
+        (2, "2️⃣ Два (за 24ч и 12ч)"),
+        (3, "3️⃣ Три (за 24ч, 16ч, 8ч)"),
+        (4, "4️⃣ Четыре (за 24ч, 18ч, 12ч, 6ч)"),
+    ]
+    for val, label in options:
+        prefix = "✅ " if val == current else ""
+        b.row(InlineKeyboardButton(
+            text=f"{prefix}{label}",
+            callback_data=f"adm_set_reminder:{val}"
+        ))
+    b.row(InlineKeyboardButton(text="🔙 Панель администратора", callback_data="admin_panel"))
     return b.as_markup()
 
 
@@ -674,23 +770,13 @@ PRICES_TEXT = (
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  РОУТЕРЫ
-#
-#  ВАЖНО: порядок роутеров критичен!
-#
-#  auth_router    — /admin + пароль (БЕЗ IsAdmin фильтра)
-#  common_router  — общие команды и меню
-#  user_router    — запись клиента (FSM)
-#  admin_cb_router— ТОЛЬКО callback кнопки администратора (с IsAdmin)
-#  admin_fsm_router — ТОЛЬКО текстовый ввод для FSM администратора
-#                     (БЕЗ IsAdmin, только по состоянию FSM)
-#                     ← ЭТО КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
 # ══════════════════════════════════════════════════════════════════════════════
 
 auth_router      = Router()
 common_router    = Router()
 user_router      = Router()
-admin_cb_router  = Router()   # кнопки — с IsAdmin
-admin_fsm_router = Router()   # текстовый ввод — БЕЗ IsAdmin (только FSM-состояние)
+admin_cb_router  = Router()
+admin_fsm_router = Router()
 
 admin_cb_router.callback_query.filter(IsAdmin())
 
@@ -741,7 +827,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @common_router.callback_query(F.data == "main_menu")
 async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()                                          # ← ПЕРВЫМ
+    await cb.answer()
     await state.clear()
     await cb.message.edit_text(WELCOME, reply_markup=kb_main_menu(cb.from_user.id))
 
@@ -894,7 +980,11 @@ async def cb_cal_date(cb: CallbackQuery, state: FSMContext):
     )
 
 
-@user_router.callback_query(F.data.startswith("book_slot:"))
+# ════════════════════════════════════════════════════════════════════
+# ИСПРАВЛЕНИЕ ГЛАВНОГО БАГА: callback_data теперь "bslot:{id}:{HHMM}"
+# Время без двоеточия → split всегда даёт ровно 3 части
+# ════════════════════════════════════════════════════════════════════
+@user_router.callback_query(F.data.startswith("bslot:"))
 async def cb_book_slot(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     cur_state = await state.get_state()
@@ -904,32 +994,26 @@ async def cb_book_slot(cb: CallbackQuery, state: FSMContext):
             reply_markup=kb_main_menu(cb.from_user.id)
         )
         return
-    _, sid, stime = cb.data.split(":")
-    slot = await db_get_slot(int(sid))
+
+    parts  = cb.data.split(":")          # ["bslot", "5", "1700"]
+    sid    = int(parts[1])
+    # Восстанавливаем "17:00" из "1700"
+    stime  = parts[2][:2] + ":" + parts[2][2:]
+
+    slot = await db_get_slot(sid)
     if not slot or slot["is_booked"]:
         await cb.answer("⚡ Это время уже занято! Выберите другое.", show_alert=True)
         return
+
     data = await state.get_data()
-    await state.update_data(slot_id=int(sid), slot_time=stime)
-    await state.set_state(BookFSM.name)
+    await state.update_data(slot_id=sid, slot_time=stime)
+
+    # ─── ТЕЛЕФОН ПЕРВЫЙ ───────────────────────────────────────────
+    await state.set_state(BookFSM.phone)
     await cb.message.edit_text(
         f"💇‍♀️ <b>{data.get('service', 'Услуга')}</b>\n"
         f"📅 {fmt_date_ru(data['chosen_date'])} в <b>{stime}</b>\n\n"
-        f"👤 <b>Шаг 4 из 4 — Введите ваше имя:</b>"
-    )
-
-
-@user_router.message(BookFSM.name)
-async def fsm_name(message: Message, state: FSMContext):
-    name = message.text.strip()
-    if len(name) < 2:
-        await message.answer("Введите корректное имя (минимум 2 символа).")
-        return
-    await state.update_data(name=name)
-    await state.set_state(BookFSM.phone)
-    await message.answer(
-        f"✅ Имя: <b>{name}</b>\n\n"
-        f"📞 <b>Введите номер телефона:</b>\n"
+        f"📞 <b>Шаг 4 из 5 — Введите номер телефона:</b>\n"
         f"<i>Например: +79001234567</i>"
     )
 
@@ -940,14 +1024,28 @@ async def fsm_phone(message: Message, state: FSMContext):
     if len("".join(c for c in phone if c.isdigit())) < 10:
         await message.answer("Введите корректный номер.\n<i>Например: +79001234567</i>")
         return
-    data = await state.get_data()
     await state.update_data(phone=phone)
+    await state.set_state(BookFSM.name)
+    await message.answer(
+        f"✅ Телефон: <b>{phone}</b>\n\n"
+        f"👤 <b>Шаг 5 из 5 — Введите ваше имя:</b>"
+    )
+
+
+@user_router.message(BookFSM.name)
+async def fsm_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if len(name) < 2:
+        await message.answer("Введите корректное имя (минимум 2 символа).")
+        return
+    data = await state.get_data()
+    await state.update_data(name=name)
     await state.set_state(BookFSM.confirm)
     await message.answer(
         f"📋 <b>Проверьте данные:</b>\n\n"
         f"💇‍♀️ Услуга:  <b>{data.get('service', '—')}</b>\n"
-        f"👤 Имя:     <b>{data['name']}</b>\n"
-        f"📞 Телефон: <b>{phone}</b>\n"
+        f"📞 Телефон: <b>{data['phone']}</b>\n"
+        f"👤 Имя:     <b>{name}</b>\n"
         f"📅 Дата:    <b>{fmt_date_ru(data['chosen_date'])}</b>\n"
         f"🕐 Время:   <b>{data['slot_time']}</b>\n\n"
         f"📍 <b>{MASTER_ADDRESS}</b>",
@@ -994,7 +1092,6 @@ async def cb_book_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
     service    = data.get("service", "Услуга")
     first_name = user.first_name or data["name"]
 
-    # ── Красивое сообщение клиенту ─────────────────────────────────────────
     await cb.message.edit_text(
         f"✅ <b>Вы записаны к {MASTER_NAME_FULL}!</b>\n\n"
         f"┌──────────────────────────\n"
@@ -1007,7 +1104,6 @@ async def cb_book_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
         reply_markup=kb_main_menu(user.id)
     )
 
-    # ── Уведомление администратору ─────────────────────────────────────────
     try:
         uname = f"@{user.username}" if user.username else f"ID <code>{user.id}</code>"
         await bot.send_message(
@@ -1025,7 +1121,6 @@ async def cb_book_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
     except Exception as e:
         log.error(f"Уведомление ADMIN: {e}")
 
-    # ── Канал расписания ───────────────────────────────────────────────────
     if SCHEDULE_CHANNEL:
         try:
             await bot.send_message(
@@ -1036,12 +1131,12 @@ async def cb_book_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
         except Exception as e:
             log.error(f"Канал расписания: {e}")
 
-    # ── Напоминание за 24ч ─────────────────────────────────────────────────
     try:
         visit_dt = datetime.strptime(
             f"{data['chosen_date']} {data['slot_time']}", "%Y-%m-%d %H:%M"
         )
-        sched_add(bot, booking_id, user.id, first_name, service, visit_dt)
+        reminder_count = await get_reminder_count()
+        sched_add(bot, booking_id, user.id, first_name, service, visit_dt, reminder_count)
     except Exception as e:
         log.error(f"Планировщик: {e}")
 
@@ -1057,7 +1152,7 @@ async def cb_visit_ok(cb: CallbackQuery):
         await cb.message.edit_text("Запись не найдена.")
         return
     await cb.message.edit_text(
-        f"✅ Отлично! Ждём вас завтра в <b>{b['time']}</b>!\n\n"
+        f"✅ Отлично! Ждём вас в <b>{b['time']}</b>!\n\n"
         f"📍 <b>{MASTER_ADDRESS}</b>\n\nДо встречи! 💅"
     )
 
@@ -1106,7 +1201,7 @@ async def cb_my_booking(cb: CallbackQuery):
             f"📋 <b>Ваша запись</b>\n\n"
             f"💇‍♀️ <b>{b.get('service', '—')}</b>\n"
             f"📅 {fmt_date_ru(b['date'])} в <b>{b['time']}</b>\n"
-            f"👤 {b['name']}  📞 {b['phone']}\n\n"
+            f"📞 {b['phone']}  👤 {b['name']}\n\n"
             f"📍 {MASTER_ADDRESS}",
             reply_markup=kb_cancel_booking(b["booking_id"])
         )
@@ -1156,8 +1251,7 @@ async def cb_adm_all_bookings(cb: CallbackQuery):
     bookings = await db_get_all_future_bookings_detail()
     if not bookings:
         await cb.message.edit_text(
-            "📊 <b>Предстоящих записей нет.</b>\n\n"
-            "Добавьте рабочие дни — кнопка «➕ Добавить рабочий день».",
+            "📊 <b>Предстоящих записей нет.</b>",
             reply_markup=kb_admin_back()
         )
         return
@@ -1172,7 +1266,7 @@ async def cb_adm_all_bookings(cb: CallbackQuery):
         svc   = b.get("service") or "—"
         lines.append(
             f"  🕐 <b>{b['time']}</b>  💇 {svc}\n"
-            f"  👤 {b['name']}  📞 {b['phone']}\n"
+            f"  📞 {b['phone']}  👤 {b['name']}\n"
             f"  💬 {uname}"
         )
 
@@ -1180,6 +1274,41 @@ async def cb_adm_all_bookings(cb: CallbackQuery):
     if len(text) > 4000:
         text = text[:4000] + "\n\n<i>…список обрезан</i>"
     await cb.message.edit_text(text, reply_markup=kb_admin_back())
+
+
+# ─── Настройка напоминаний ────────────────────────────────────────────────────
+
+@admin_cb_router.callback_query(F.data == "adm_reminder_settings")
+async def cb_adm_reminder_settings(cb: CallbackQuery):
+    await cb.answer()
+    current = await get_reminder_count()
+    await cb.message.edit_text(
+        f"🔔 <b>Настройка напоминаний</b>\n\n"
+        f"Сейчас: <b>{current} напоминание(й)</b> за 24ч до визита\n\n"
+        f"Выберите сколько раз напоминать клиентам:",
+        reply_markup=kb_reminder_settings(current)
+    )
+
+
+@admin_cb_router.callback_query(F.data.startswith("adm_set_reminder:"))
+async def cb_adm_set_reminder(cb: CallbackQuery):
+    await cb.answer()
+    count = int(cb.data.split(":")[1])
+    await db_set_setting("reminder_count", str(count))
+    descriptions = {
+        1: "за 24 часа до визита",
+        2: "за 24 и 12 часов до визита",
+        3: "за 24, 16 и 8 часов до визита",
+        4: "за 24, 18, 12 и 6 часов до визита",
+    }
+    await cb.message.edit_text(
+        f"✅ <b>Настройка сохранена!</b>\n\n"
+        f"Теперь клиенты будут получать <b>{count}</b> напоминание(й)\n"
+        f"<i>({descriptions.get(count, '')})</i>\n\n"
+        f"⚠️ Изменение применяется к <b>новым</b> записям.\n"
+        f"Для существующих нужно перезапустить бота.",
+        reply_markup=kb_admin_back()
+    )
 
 
 # ─── Добавить рабочий день ────────────────────────────────────────────────────
@@ -1190,8 +1319,7 @@ async def cb_adm_add_day(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AdminFSM.add_day_date)
     await cb.message.edit_text(
         "➕ <b>Новый рабочий день</b>\n\n"
-        "Добавятся слоты с 09:00 до 18:00.\n"
-        "После этого день станет 🟢 в календаре клиентов.\n\n"
+        "Добавятся слоты с 09:00 до 18:00.\n\n"
         "Введите дату <code>ДД.ММ.ГГГГ</code>:",
         reply_markup=kb_admin_back()
     )
@@ -1358,9 +1486,6 @@ async def cb_adm_do_broadcast(cb: CallbackQuery, state: FSMContext, bot: Bot):
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ADMIN — FSM ТЕКСТОВЫЙ ВВОД (admin_fsm_router, БЕЗ IsAdmin!)
-#  Это ключевое исправление: ввод даты/времени работает всегда,
-#  т.к. не зависит от IsAdmin-фильтра.
-#  Защита — через проверку FSM-состояния.
 # ══════════════════════════════════════════════════════════════════════════════
 
 @admin_fsm_router.message(AdminFSM.add_day_date)
@@ -1379,7 +1504,7 @@ async def fsm_add_day(message: Message, state: FSMContext):
     await message.answer(
         f"✅ День <b>{fmt_date_ru(sd)}</b> добавлен!\n"
         f"Слотов: <b>{added}</b>\n\n"
-        f"Теперь клиенты видят 🟢 на эту дату в календаре.",
+        f"Клиенты видят 🟢 на эту дату в календаре.",
         reply_markup=kb_admin_main()
     )
 
@@ -1426,9 +1551,7 @@ async def fsm_del_slot_date(message: Message, state: FSMContext):
     free  = [s for s in slots if not s["is_booked"]]
     await state.clear()
     if not free:
-        await message.answer(
-            "Нет свободных слотов для удаления.", reply_markup=kb_admin_main()
-        )
+        await message.answer("Нет свободных слотов для удаления.", reply_markup=kb_admin_main())
         return
     await message.answer(
         f"📅 <b>{fmt_date_ru(sd)}</b> — выберите слот:",
@@ -1548,12 +1671,6 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
 
-    # ПОРЯДОК ВАЖЕН:
-    # 1. auth_router      — /admin + пароль (без IsAdmin)
-    # 2. common_router    — общие команды
-    # 3. user_router      — запись клиента
-    # 4. admin_cb_router  — кнопки админа (с IsAdmin)
-    # 5. admin_fsm_router — текстовый ввод FSM админа (без IsAdmin, только по состоянию)
     dp.include_router(auth_router)
     dp.include_router(common_router)
     dp.include_router(user_router)
