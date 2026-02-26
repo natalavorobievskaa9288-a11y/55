@@ -2,11 +2,12 @@
 Telegram-бот для записи к мастеру — Полина Евдокимова.
 Aiogram 3 · SQLite (aiosqlite)
 
-v9:
-✅ Авторизация админа сохраняется в БД — не слетает при перезапуске
-✅ Пользователи не теряются из базы никогда
-✅ Тексты услуг меняются сразу для всех клиентов
-✅ Исправлен подсчёт пользователей
+v10:
+✅ Система отзывов: написать отзыв (оценка ⭐ + текст) → модерация у админа → публикация
+✅ Листалка отзывов (1 отзыв на экране, кнопки ◀ ▶)
+✅ Счётчик пользователей не считает самого администратора
+✅ Авторизация админа постоянная (в БД)
+✅ Тексты услуг редактируются в админке и применяются для всех
 """
 
 import asyncio
@@ -104,10 +105,10 @@ class SQLiteFSMStorage(BaseStorage):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  КОНФИГУРАЦИЯ  ←  ЗАПОЛНИТЕ ПЕРЕД ЗАПУСКОМ
+#  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN      = "8386414173:AAEy5JnqOpqKvT72RQi8NeoMx7tk9xxEJyk"
+BOT_TOKEN      = "ВАШ_ТОКЕН"
 ADMIN_ID       = 123456789
 DB_PATH        = "manicure.db"
 ADMIN_PASSWORD = "adinspalina999"
@@ -130,14 +131,14 @@ SERVICES = [
 
 DEFAULT_SERVICE_TEXTS = [
     "Здравствуйте, я с бота по записи, хочу записаться на сложное окрашивание",
-    "Здравствуйте, я с бота по записи, хочу записаться в один тон",
+    "Здравствуйте, я с бота по записи, хочу записаться на окрашивание в один тон",
     "Здравствуйте, я с бота по записи, хочу записаться на окрашивание корней",
     "Здравствуйте, я с бота по записи, хочу записаться на тонирование блонда",
     "Здравствуйте, я с бота по записи, хочу записаться на осветление корней + тонирование",
     "Здравствуйте, я с бота по записи, хочу записаться на глубокий контуринг",
     "Здравствуйте, я с бота по записи, хочу записаться на стрижку",
     "Здравствуйте, я с бота по записи, хочу записаться на укладку (брашинг)",
-    "Здравствуйте, я с бота по записи, хочу записаться на укладку локонами",
+    "Здравствуйте, я с бота по записи, хочу записаться на укладку локоны",
 ]
 
 logging.basicConfig(
@@ -171,6 +172,18 @@ async def init_db():
                 user_id   INTEGER PRIMARY KEY,
                 authed_at TEXT NOT NULL
             );
+
+            -- Отзывы: status = 'pending' | 'approved' | 'rejected'
+            CREATE TABLE IF NOT EXISTS reviews (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                username   TEXT,
+                first_name TEXT,
+                rating     INTEGER NOT NULL,
+                text       TEXT NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            );
         """)
         await db.commit()
     log.info("БД готова.")
@@ -179,7 +192,6 @@ async def init_db():
 # ── Пользователи ──────────────────────────────────────────────────────────────
 
 async def db_save_user(user_id: int, username: str | None, first_name: str | None):
-    """Сохраняет нового пользователя. Уже существующих не трогает (дата сохраняется)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (user_id, username, first_name, created_at)
@@ -207,9 +219,15 @@ async def db_get_all_user_ids() -> list[int]:
         return [r[0] for r in await cur.fetchall()]
 
 
-async def db_count_users() -> int:
+async def db_count_users(exclude_id: int | None = None) -> int:
+    """Считает всех пользователей, опционально исключая одного (например, администратора)."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM users")
+        if exclude_id:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM users WHERE user_id != ?", (exclude_id,)
+            )
+        else:
+            cur = await db.execute("SELECT COUNT(*) FROM users")
         row = await cur.fetchone()
     return row[0] if row else 0
 
@@ -240,7 +258,7 @@ async def db_reset_service_text(svc_index: int):
         await db.commit()
 
 
-# ── Постоянная авторизация админов ───────────────────────────────────────────
+# ── Авторизация админов ───────────────────────────────────────────────────────
 
 async def db_admin_add(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -259,6 +277,58 @@ async def db_admin_check(user_id: int) -> bool:
         return await cur.fetchone() is not None
 
 
+# ── Отзывы ────────────────────────────────────────────────────────────────────
+
+async def db_add_review(user_id: int, username: str | None, first_name: str | None,
+                        rating: int, text: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            INSERT INTO reviews (user_id, username, first_name, rating, text, status, created_at)
+            VALUES (?,?,?,?,?,'pending',?)
+        """, (user_id, username, first_name, rating, text, datetime.now().isoformat()))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def db_get_approved_reviews() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT id, user_id, username, first_name, rating, text, created_at
+            FROM reviews WHERE status='approved'
+            ORDER BY created_at DESC
+        """)
+        rows = await cur.fetchall()
+    return [{"id": r[0], "user_id": r[1], "username": r[2], "first_name": r[3],
+             "rating": r[4], "text": r[5], "created_at": r[6]} for r in rows]
+
+
+async def db_get_pending_reviews() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT id, user_id, username, first_name, rating, text, created_at
+            FROM reviews WHERE status='pending'
+            ORDER BY created_at ASC
+        """)
+        rows = await cur.fetchall()
+    return [{"id": r[0], "user_id": r[1], "username": r[2], "first_name": r[3],
+             "rating": r[4], "text": r[5], "created_at": r[6]} for r in rows]
+
+
+async def db_set_review_status(review_id: int, status: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE reviews SET status=? WHERE id=?", (status, review_id)
+        )
+        await db.commit()
+
+
+async def db_count_approved_reviews() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM reviews WHERE status='approved'")
+        row = await cur.fetchone()
+    return row[0] if row else 0
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ХЭЛПЕРЫ
 # ══════════════════════════════════════════════════════════════════════════════
@@ -275,6 +345,23 @@ async def make_master_link(svc_index: int) -> str:
     return f"https://t.me/{MASTER_USERNAME}?text={encoded}"
 
 
+def stars(rating: int) -> str:
+    return "⭐" * rating + "☆" * (5 - rating)
+
+
+def format_review(r: dict, idx: int, total: int) -> str:
+    name  = r["first_name"] or "Аноним"
+    uname = f" (@{r['username']})" if r["username"] else ""
+    date  = r["created_at"][:10]
+    return (
+        f"💬 <b>Отзыв {idx} из {total}</b>\n"
+        f"{'─'*28}\n"
+        f"{stars(r['rating'])}  <b>{name}</b>{uname}\n"
+        f"<i>{date}</i>\n\n"
+        f"{r['text']}"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  FSM-СОСТОЯНИЯ
 # ══════════════════════════════════════════════════════════════════════════════
@@ -284,6 +371,11 @@ class AdminFSM(StatesGroup):
     broadcast_msg     = State()
     broadcast_confirm = State()
     edit_svc_text     = State()
+
+
+class ReviewFSM(StatesGroup):
+    rating = State()
+    text   = State()
 
 
 class IsAdmin(Filter):
@@ -305,6 +397,7 @@ async def kb_main_menu(user_id: int = 0) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="💰 Прайс-лист", callback_data="prices"),
         InlineKeyboardButton(text="🌸 Портфолио",  callback_data="portfolio"),
     )
+    b.row(InlineKeyboardButton(text="⭐ Отзывы", callback_data="reviews_menu"))
     if await is_admin(user_id):
         b.row(InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel"))
     return b.as_markup()
@@ -354,6 +447,7 @@ def kb_admin_main() -> InlineKeyboardMarkup:
     b.row(InlineKeyboardButton(text="👥 Список пользователей",    callback_data="adm_users"))
     b.row(InlineKeyboardButton(text="📣 Рассылка всем клиентам",  callback_data="adm_broadcast"))
     b.row(InlineKeyboardButton(text="✏️ Тексты для записи",       callback_data="adm_svc_texts"))
+    b.row(InlineKeyboardButton(text="🛡 Модерация отзывов",       callback_data="adm_reviews"))
     b.row(InlineKeyboardButton(text="🔙 Главное меню",            callback_data="main_menu"))
     return b.as_markup()
 
@@ -386,6 +480,61 @@ def kb_svc_text_edit(svc_index: int) -> InlineKeyboardMarkup:
         text="❌ Отменить редактирование",
         callback_data="adm_svc_texts"
     ))
+    return b.as_markup()
+
+
+# ── Отзывы (пользователь) ─────────────────────────────────────────────────────
+
+def kb_reviews_menu() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📖 Смотреть отзывы",   callback_data="reviews_browse:0"))
+    b.row(InlineKeyboardButton(text="✍️ Написать отзыв",    callback_data="review_write"))
+    b.row(InlineKeyboardButton(text="🔙 Главное меню",      callback_data="main_menu"))
+    return b.as_markup()
+
+
+def kb_rating() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for i in range(1, 6):
+        b.button(text=f"{'⭐'*i}", callback_data=f"rate:{i}")
+    b.adjust(5)
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="reviews_menu"))
+    return b.as_markup()
+
+
+def kb_reviews_nav(idx: int, total: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    row = []
+    if idx > 0:
+        row.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"reviews_browse:{idx-1}"))
+    row.append(InlineKeyboardButton(text=f"{idx+1}/{total}", callback_data="noop"))
+    if idx < total - 1:
+        row.append(InlineKeyboardButton(text="Вперёд ▶", callback_data=f"reviews_browse:{idx+1}"))
+    b.row(*row)
+    b.row(InlineKeyboardButton(text="✍️ Написать отзыв", callback_data="review_write"))
+    b.row(InlineKeyboardButton(text="🔙 Главное меню",   callback_data="main_menu"))
+    return b.as_markup()
+
+
+def kb_review_confirm() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✅ Отправить", callback_data="review_submit"),
+        InlineKeyboardButton(text="✏️ Изменить",  callback_data="review_write"),
+    )
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="reviews_menu"))
+    return b.as_markup()
+
+
+# ── Модерация отзывов (админ) ─────────────────────────────────────────────────
+
+def kb_moderate_review(review_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✅ Одобрить",  callback_data=f"adm_rev_ok:{review_id}"),
+        InlineKeyboardButton(text="🗑 Удалить",   callback_data=f"adm_rev_del:{review_id}"),
+    )
+    b.row(InlineKeyboardButton(text="🔙 К модерации", callback_data="adm_reviews"))
     return b.as_markup()
 
 
@@ -426,6 +575,7 @@ PRICES_TEXT = (
 auth_router      = Router()
 common_router    = Router()
 user_router      = Router()
+review_router    = Router()
 admin_cb_router  = Router()
 admin_fsm_router = Router()
 
@@ -449,7 +599,6 @@ async def cmd_admin_entry(message: Message, state: FSMContext):
 @auth_router.message(AdminFSM.password)
 async def fsm_admin_password(message: Message, state: FSMContext):
     if message.text and message.text.strip() == ADMIN_PASSWORD:
-        # ✅ Записываем в БД — навсегда, не слетает при перезапуске бота
         await db_admin_add(message.from_user.id)
         await state.clear()
         try:
@@ -486,6 +635,11 @@ async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(WELCOME, reply_markup=await kb_main_menu(cb.from_user.id))
 
 
+@common_router.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
 @common_router.callback_query(F.data == "prices")
 async def cb_prices(cb: CallbackQuery):
     await cb.answer()
@@ -502,7 +656,7 @@ async def cb_portfolio(cb: CallbackQuery):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ЗАПИСЬ — ВЫБОР УСЛУГИ → РЕДИРЕКТ К МАСТЕРУ
+#  ЗАПИСЬ
 # ══════════════════════════════════════════════════════════════════════════════
 
 @user_router.callback_query(F.data == "book_start")
@@ -533,6 +687,139 @@ async def cb_book_service(cb: CallbackQuery):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ОТЗЫВЫ — ПОЛЬЗОВАТЕЛЬ
+# ══════════════════════════════════════════════════════════════════════════════
+
+@review_router.callback_query(F.data == "reviews_menu")
+async def cb_reviews_menu(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    total = await db_count_approved_reviews()
+    await cb.message.edit_text(
+        f"⭐ <b>Отзывы клиентов</b>\n\n"
+        f"Всего отзывов: <b>{total}</b>\n\n"
+        f"Здесь вы можете почитать отзывы других клиентов или оставить свой:",
+        reply_markup=kb_reviews_menu()
+    )
+
+
+@review_router.callback_query(F.data.startswith("reviews_browse:"))
+async def cb_reviews_browse(cb: CallbackQuery):
+    await cb.answer()
+    idx      = int(cb.data.split(":")[1])
+    reviews  = await db_get_approved_reviews()
+    total    = len(reviews)
+
+    if total == 0:
+        await cb.message.edit_text(
+            "💬 <b>Отзывов пока нет.</b>\n\nБудьте первым — оставьте отзыв!",
+            reply_markup=kb_reviews_menu()
+        )
+        return
+
+    # Защита от выхода за пределы
+    idx = max(0, min(idx, total - 1))
+    r   = reviews[idx]
+
+    await cb.message.edit_text(
+        format_review(r, idx + 1, total),
+        reply_markup=kb_reviews_nav(idx, total)
+    )
+
+
+@review_router.callback_query(F.data == "review_write")
+async def cb_review_write(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    await state.set_state(ReviewFSM.rating)
+    await cb.message.edit_text(
+        "✍️ <b>Оставить отзыв</b>\n\n"
+        "Шаг 1 из 2: Выберите вашу оценку 👇",
+        reply_markup=kb_rating()
+    )
+
+
+@review_router.callback_query(ReviewFSM.rating, F.data.startswith("rate:"))
+async def cb_review_rating(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    rating = int(cb.data.split(":")[1])
+    await state.update_data(rating=rating)
+    await state.set_state(ReviewFSM.text)
+    await cb.message.edit_text(
+        f"✍️ <b>Оставить отзыв</b>\n\n"
+        f"Ваша оценка: {stars(rating)}\n\n"
+        f"Шаг 2 из 2: Напишите ваш отзыв текстом 👇\n"
+        f"<i>(минимум 10 символов)</i>",
+        reply_markup=InlineKeyboardBuilder().row(
+            InlineKeyboardButton(text="❌ Отмена", callback_data="reviews_menu")
+        ).as_markup()
+    )
+
+
+@review_router.message(ReviewFSM.text)
+async def fsm_review_text(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if len(text) < 10:
+        await message.answer("⚠️ Отзыв слишком короткий. Напишите хотя бы 10 символов:")
+        return
+
+    data   = await state.get_data()
+    rating = data.get("rating", 5)
+    await state.update_data(review_text=text)
+    await state.set_state(ReviewFSM.text)  # остаёмся, ждём confirm
+
+    await message.answer(
+        f"👀 <b>Предпросмотр вашего отзыва:</b>\n\n"
+        f"{stars(rating)}\n\n"
+        f"{text}\n\n"
+        f"Всё верно? После отправки отзыв уйдёт на проверку мастеру.",
+        reply_markup=kb_review_confirm()
+    )
+
+
+@review_router.callback_query(F.data == "review_submit")
+async def cb_review_submit(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    await cb.answer()
+    data   = await state.get_data()
+    rating = data.get("rating")
+    text   = data.get("review_text")
+
+    if not rating or not text:
+        await cb.message.edit_text(
+            "Что-то пошло не так. Попробуйте снова.",
+            reply_markup=kb_reviews_menu()
+        )
+        await state.clear()
+        return
+
+    user = cb.from_user
+    review_id = await db_add_review(user.id, user.username, user.first_name, rating, text)
+    await state.clear()
+
+    await cb.message.edit_text(
+        "✅ <b>Спасибо за отзыв!</b>\n\n"
+        "Он отправлен на проверку мастеру и скоро появится в общем списке.",
+        reply_markup=kb_reviews_menu()
+    )
+
+    # Уведомляем администратора
+    name  = user.first_name or "Аноним"
+    uname = f" (@{user.username})" if user.username else ""
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🔔 <b>Новый отзыв на проверку!</b>\n\n"
+            f"От: <b>{name}</b>{uname}\n"
+            f"Оценка: {stars(rating)}\n\n"
+            f"{text}\n\n"
+            f"<i>ID отзыва: {review_id}</i>",
+            reply_markup=kb_moderate_review(review_id)
+        )
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ADMIN — CALLBACK КНОПКИ
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -550,10 +837,13 @@ async def cb_adm_users(cb: CallbackQuery):
     total = len(users)
 
     if not users:
-        await cb.message.edit_text("👥 <b>Пользователей пока нет.</b>", reply_markup=kb_admin_back())
+        await cb.message.edit_text(
+            "👥 <b>Пользователей пока нет.</b>",
+            reply_markup=kb_admin_back()
+        )
         return
 
-    lines = [f"👥 <b>Всего пользователей: {total} чел.</b>\n"]
+    lines = [f"👥 <b>Пользователей в боте: {total} чел.</b>\n"]
     for u in users[:50]:
         uname = f"@{u['username']}" if u["username"] else f"ID {u['user_id']}"
         name  = u["first_name"] or "—"
@@ -589,6 +879,7 @@ async def cb_adm_do_broadcast(cb: CallbackQuery, state: FSMContext, bot: Bot):
     text = data.get("broadcast_text", "")
     await state.clear()
 
+    # Рассылаем всем включая администратора
     user_ids = await db_get_all_user_ids()
     sent = failed = 0
     await cb.message.edit_text(f"📣 Отправляю... ({len(user_ids)} получателей)")
@@ -617,7 +908,7 @@ async def cb_adm_svc_texts(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text(
         "✏️ <b>Редактирование авто-текстов</b>\n\n"
-        "Выберите услугу — изменения сразу применяются для <b>всех</b> пользователей:",
+        "Выберите услугу — изменения применяются сразу для <b>всех</b> пользователей:",
         reply_markup=kb_svc_texts_list()
     )
 
@@ -625,11 +916,11 @@ async def cb_adm_svc_texts(cb: CallbackQuery, state: FSMContext):
 @admin_cb_router.callback_query(F.data.startswith("adm_edit_svc:"))
 async def cb_adm_edit_svc(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    idx         = int(cb.data.split(":")[1])
-    svc_name    = SERVICES[idx][0]
-    current     = await db_get_service_text(idx)
-    is_custom   = (current != DEFAULT_SERVICE_TEXTS[idx])
-    status      = "🟡 изменён вами" if is_custom else "🟢 стандартный"
+    idx       = int(cb.data.split(":")[1])
+    svc_name  = SERVICES[idx][0]
+    current   = await db_get_service_text(idx)
+    is_custom = (current != DEFAULT_SERVICE_TEXTS[idx])
+    status    = "🟡 изменён вами" if is_custom else "🟢 стандартный"
 
     await state.set_state(AdminFSM.edit_svc_text)
     await state.update_data(editing_svc_index=idx)
@@ -655,6 +946,98 @@ async def cb_adm_reset_svc(cb: CallbackQuery, state: FSMContext):
         f"✅ <b>Текст для «{svc_name}» сброшен на стандартный:</b>\n\n"
         f"<code>{DEFAULT_SERVICE_TEXTS[idx]}</code>",
         reply_markup=kb_svc_texts_list()
+    )
+
+
+# ── Модерация отзывов ─────────────────────────────────────────────────────────
+
+@admin_cb_router.callback_query(F.data == "adm_reviews")
+async def cb_adm_reviews(cb: CallbackQuery):
+    await cb.answer()
+    pending = await db_get_pending_reviews()
+
+    if not pending:
+        await cb.message.edit_text(
+            "🛡 <b>Модерация отзывов</b>\n\n"
+            "✅ Нет отзывов на проверке. Всё чисто!",
+            reply_markup=kb_admin_back()
+        )
+        return
+
+    r     = pending[0]
+    name  = r["first_name"] or "Аноним"
+    uname = f" (@{r['username']})" if r["username"] else ""
+    date  = r["created_at"][:10]
+
+    await cb.message.edit_text(
+        f"🛡 <b>Модерация отзывов</b>\n"
+        f"Ожидают проверки: <b>{len(pending)}</b>\n\n"
+        f"{'─'*28}\n"
+        f"От: <b>{name}</b>{uname} | {date}\n"
+        f"Оценка: {stars(r['rating'])}\n\n"
+        f"{r['text']}",
+        reply_markup=kb_moderate_review(r["id"])
+    )
+
+
+@admin_cb_router.callback_query(F.data.startswith("adm_rev_ok:"))
+async def cb_adm_rev_approve(cb: CallbackQuery):
+    await cb.answer("✅ Отзыв одобрен!")
+    review_id = int(cb.data.split(":")[1])
+    await db_set_review_status(review_id, "approved")
+
+    # Показываем следующий на модерации
+    pending = await db_get_pending_reviews()
+    if not pending:
+        await cb.message.edit_text(
+            "🛡 <b>Модерация отзывов</b>\n\n"
+            "✅ Все отзывы проверены!",
+            reply_markup=kb_admin_back()
+        )
+        return
+
+    r     = pending[0]
+    name  = r["first_name"] or "Аноним"
+    uname = f" (@{r['username']})" if r["username"] else ""
+    date  = r["created_at"][:10]
+    await cb.message.edit_text(
+        f"🛡 <b>Модерация отзывов</b>\n"
+        f"Ожидают проверки: <b>{len(pending)}</b>\n\n"
+        f"{'─'*28}\n"
+        f"От: <b>{name}</b>{uname} | {date}\n"
+        f"Оценка: {stars(r['rating'])}\n\n"
+        f"{r['text']}",
+        reply_markup=kb_moderate_review(r["id"])
+    )
+
+
+@admin_cb_router.callback_query(F.data.startswith("adm_rev_del:"))
+async def cb_adm_rev_delete(cb: CallbackQuery):
+    await cb.answer("🗑 Отзыв удалён.")
+    review_id = int(cb.data.split(":")[1])
+    await db_set_review_status(review_id, "rejected")
+
+    pending = await db_get_pending_reviews()
+    if not pending:
+        await cb.message.edit_text(
+            "🛡 <b>Модерация отзывов</b>\n\n"
+            "✅ Все отзывы проверены!",
+            reply_markup=kb_admin_back()
+        )
+        return
+
+    r     = pending[0]
+    name  = r["first_name"] or "Аноним"
+    uname = f" (@{r['username']})" if r["username"] else ""
+    date  = r["created_at"][:10]
+    await cb.message.edit_text(
+        f"🛡 <b>Модерация отзывов</b>\n"
+        f"Ожидают проверки: <b>{len(pending)}</b>\n\n"
+        f"{'─'*28}\n"
+        f"От: <b>{name}</b>{uname} | {date}\n"
+        f"Оценка: {stars(r['rating'])}\n\n"
+        f"{r['text']}",
+        reply_markup=kb_moderate_review(r["id"])
     )
 
 
@@ -692,10 +1075,9 @@ async def fsm_edit_svc_text(message: Message, state: FSMContext):
 
     await db_set_service_text(idx, new_text)
     await state.clear()
-
     svc_name = SERVICES[idx][0]
     await message.answer(
-        f"✅ <b>Готово! Текст для «{svc_name}» обновлён для всех пользователей.</b>\n\n"
+        f"✅ <b>Текст для «{svc_name}» обновлён для всех пользователей!</b>\n\n"
         f"<b>Новый текст:</b>\n"
         f"<code>{new_text}</code>",
         reply_markup=kb_svc_texts_list()
@@ -722,6 +1104,7 @@ async def main():
     dp.include_router(auth_router)
     dp.include_router(common_router)
     dp.include_router(user_router)
+    dp.include_router(review_router)
     dp.include_router(admin_cb_router)
     dp.include_router(admin_fsm_router)
 
