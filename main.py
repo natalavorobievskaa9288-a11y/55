@@ -36,7 +36,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 #  КОНФИГУРАЦИЯ  ←  ЗАПОЛНИТЕ ПЕРЕД ЗАПУСКОМ
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN        = "ВАШ_ТОКЕН"               # токен от @BotFather
+BOT_TOKEN        = "8386414173:AAFGFsMCu4mkJXlsWUUm7GLcfhTxF0cMniU"               # токен от @BotFather
 ADMIN_ID         = 123456789                   # ваш Telegram ID (@userinfobot)
 SCHEDULE_CHANNEL = ""                          # "@channel" или "" чтобы отключить
 CHANNEL_ID       = "@evdokimovapolinatg"       # канал для проверки подписки
