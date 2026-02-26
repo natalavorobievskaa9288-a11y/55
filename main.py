@@ -108,7 +108,7 @@ class SQLiteFSMStorage(BaseStorage):
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN      = "ВАШ_ТОКЕН"
+BOT_TOKEN      = "8386414173:AAEy5JnqOpqKvT72RQi8NeoMx7tk9xxEJyk"
 ADMIN_ID       = 123456789
 DB_PATH        = "manicure.db"
 ADMIN_PASSWORD = "adinspalina999"
