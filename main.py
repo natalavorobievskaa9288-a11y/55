@@ -107,7 +107,7 @@ class SQLiteFSMStorage(BaseStorage):
 #  КОНФИГУРАЦИЯ  ←  ЗАПОЛНИТЕ ПЕРЕД ЗАПУСКОМ
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN      = "ВАШ_ТОКЕН"       # токен от @BotFather
+BOT_TOKEN      = "8386414173:AAEy5JnqOpqKvT72RQi8NeoMx7tk9xxEJyk"       # токен от @BotFather
 ADMIN_ID       = 123456789          # ваш Telegram ID (@userinfobot)
 DB_PATH        = "manicure.db"
 ADMIN_PASSWORD = "adinspalina999"
